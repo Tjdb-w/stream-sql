@@ -1,15 +1,16 @@
 """流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进）。
 
 公开入口：
-    compile_query(sql) -> StreamQuery
+    compile_query(sql, capacity=None) -> StreamQuery
 
 StreamQuery:
-    push(record)            -> "included" | "late"
+    push(record)            -> "included" | "late" | "backpressured"
     advance_watermark(ts)   -> None
     drain()                 -> list[dict]
 
 异常：
     QuerySyntaxError          SQL 不合法
+    QueryConfigurationError   capacity 等查询配置参数不合法
     InvalidRecordError        记录缺字段 / 类型不符 / 时间无法解析
     WatermarkRegressionError  水位回退
 """
@@ -24,6 +25,7 @@ __all__ = [
     "compile_query",
     "StreamQuery",
     "QuerySyntaxError",
+    "QueryConfigurationError",
     "InvalidRecordError",
     "WatermarkRegressionError",
 ]
@@ -31,6 +33,10 @@ __all__ = [
 
 class QuerySyntaxError(Exception):
     """SQL 超出受支持的语法或语义范围。"""
+
+
+class QueryConfigurationError(Exception):
+    """查询配置参数（如 capacity）不合法。"""
 
 
 class InvalidRecordError(Exception):
@@ -335,9 +341,11 @@ def _user_id_sort_key(user_id):
 class StreamQuery:
     """由 compile_query 编译得到的可执行流式查询。"""
 
-    def __init__(self, columns, window_ms):
+    def __init__(self, columns, window_ms, capacity=None):
         self._columns = tuple(columns)  # ((kind, output_name), ...)
         self._window_ms = window_ms
+        # None 表示无界；否则为可保留的最大未输出聚合键数。
+        self._capacity = capacity
         self._watermark_ms = None
         self._state = {}  # (window_start_ms, user_id) -> sum(amount)
 
@@ -350,12 +358,23 @@ class StreamQuery:
         return self._window_ms
 
     @property
+    def capacity(self):
+        """容量上限（正整数），未设置时为 None（无界）。"""
+        return self._capacity
+
+    @property
     def watermark(self):
         """当前水位（UTC 毫秒），尚未推进过时为 None。"""
         return self._watermark_ms
 
     def push(self, record):
-        """摄入一条记录，返回 "included" 或 "late"。迟到记录不改变聚合状态。"""
+        """摄入一条记录。
+
+        返回：
+            "included"       记录已累加进聚合状态；
+            "late"           事件时间早于当前水位，状态不变；
+            "backpressured"  记录属于新聚合键但容量已满，状态不变。
+        """
         if not isinstance(record, Mapping):
             raise InvalidRecordError("record must be a mapping of field name to value")
         for field in _SOURCE_FIELDS:
@@ -365,10 +384,13 @@ class StreamQuery:
         event_ms = _parse_timestamp(record["event_time"], InvalidRecordError)
         amount = _validate_amount(record["amount"])
 
+        # 迟到判断优先于容量判断：容量已满不改变迟到记录的返回值。
         if self._watermark_ms is not None and event_ms < self._watermark_ms:
             return "late"
         window_start = event_ms - (event_ms % self._window_ms)
         key = (window_start, user_id)
+        if key not in self._state and self._capacity is not None and len(self._state) >= self._capacity:
+            return "backpressured"
         self._state[key] = self._state.get(key, 0) + amount
         return "included"
 
@@ -381,7 +403,10 @@ class StreamQuery:
         self._watermark_ms = ms
 
     def drain(self):
-        """返回所有已确定（窗口结束时刻不超过当前水位）的结果，并从状态中移除。"""
+        """返回所有已确定（窗口结束时刻不超过当前水位）的结果，并从状态中移除。
+
+        移除已确定的聚合键同时释放其占用的容量，使后续新聚合键可以被接收。
+        """
         if self._watermark_ms is None:
             return []
         ready = [
@@ -411,7 +436,7 @@ class StreamQuery:
         return row
 
 
-def compile_query(sql):
+def compile_query(sql, capacity=None):
     """编译限定语法的窗口聚合 SQL，返回 StreamQuery。
 
     支持的形态（关键字与标识符大小写不敏感，空白不影响语义）：
@@ -422,10 +447,19 @@ def compile_query(sql):
                [SUM(amount) [AS alias]]
         FROM orders
         GROUP BY user_id, TUMBLE(event_time, INTERVAL n SECOND)
+
+    capacity 省略或为 None 时查询无界；给定 capacity 时，它是查询可保留的
+    最大未输出聚合键数（聚合键由窗口起点与 user_id 确定），只接受正整数，
+    否则抛 QueryConfigurationError 且不创建查询实例。
     """
     if not isinstance(sql, str):
         raise QuerySyntaxError("sql must be a string, got %s" % type(sql).__name__)
     if not sql.strip():
         raise QuerySyntaxError("sql must not be empty")
+    # 先校验 capacity：配置不合法时不进行语法解析，也不创建查询实例。
+    if capacity is not None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise QueryConfigurationError(
+                "capacity must be a positive int or None, got %r" % (capacity,))
     columns, window_ms = _Parser(_tokenize(sql)).parse()
-    return StreamQuery(columns, window_ms)
+    return StreamQuery(columns, window_ms, capacity)
