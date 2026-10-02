@@ -8,16 +8,18 @@
 
 ## 状态
 
-已实现：由乱序水位推进的事件时间翻滚窗口 SQL 聚合（`stream_sql.py`，仅标准库，无外部依赖）。
-尚未实现：Exactly-once 状态（持久化、重启恢复、记录去重）与背压控制；当前实现无任何落盘行为。
+已实现：由乱序水位推进的事件时间翻滚窗口 SQL 聚合与有界背压控制
+（`stream_sql.py`，仅标准库，无外部依赖）。
+尚未实现：Exactly-once 状态（持久化、重启恢复、记录去重）；当前实现无任何落盘行为。
 
 ## 公开接口
 
 ```python
 from stream_sql import compile_query
 
-query = compile_query(sql)          # -> StreamQuery
-query.push(record)                  # -> "included" | "late"
+query = compile_query(sql)                  # -> StreamQuery，无界
+query = compile_query(sql, capacity=100)    # -> StreamQuery，最多保留 100 个未输出聚合键
+query.push(record)                  # -> "included" | "late" | "backpressured"
 query.advance_watermark(timestamp)  # 显式推进水位
 rows = query.drain()                # -> list[dict]，已确定结果
 ```
@@ -55,10 +57,26 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
   每行只含查询声明的列；时间值输出 ISO 8601 UTC 字符串，`SUM(amount)` 输出整数。
 - 相同查询对相同记录顺序、水位顺序和 drain 时机给出相同结果。
 
+### 背压控制
+
+- `compile_query(sql, capacity=...)` 的 `capacity` 省略或为 `None` 时查询无界；
+  给定正整数时表示查询可保留的最大未输出聚合键数
+  （聚合键由窗口起点与 `user_id` 确定）。
+- `capacity` 只接受大于零的整数；`bool`、零、负数和其他类型都抛出
+  `QueryConfigurationError`，且不创建查询实例。
+- 合法记录属于已存在的聚合键时，即使容量已满也返回 `"included"` 并累加；
+  属于新聚合键且容量已满时返回 `"backpressured"`，不修改聚合状态、
+  不产生结果，也不改变水位。
+- 合法但迟到的记录优先返回 `"late"`，不因容量已满变成 `"backpressured"`。
+- 推进水位本身不释放容量；`drain()` 移除已确定聚合键后释放对应容量，
+  后续新聚合键即可被接收。
+- 每次拒绝记录后，同一查询可继续处理后续合法记录。
+
 ### 异常
 
 - `QuerySyntaxError`：SQL 出现限定字段之外的字段、不支持的表达式，
   或窗口间隔不是正的秒数。
+- `QueryConfigurationError`：`capacity` 不是大于零的整数或 `None`。
 - `InvalidRecordError`：记录缺少字段、类型不符或时间无法解析
   （`advance_watermark` 的时间参数无法解析时同样抛出）。
 - `WatermarkRegressionError`：`advance_watermark` 回退水位。

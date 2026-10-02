@@ -3,6 +3,7 @@ import unittest
 from stream_sql import (
     compile_query,
     QuerySyntaxError,
+    QueryConfigurationError,
     InvalidRecordError,
     WatermarkRegressionError,
 )
@@ -202,6 +203,101 @@ class PushAndDrainTest(unittest.TestCase):
             q.advance_watermark(20_000)
             outputs.append((first, q.drain()))
         self.assertEqual(outputs[0], outputs[1])
+
+
+class BackpressureTest(unittest.TestCase):
+    def test_capacity_validation(self):
+        for bad in (True, False, 0, -1, -100, 1.5, "3", [], object()):
+            with self.assertRaises(QueryConfigurationError, msg=repr(bad)):
+                compile_query(SQL_FULL, capacity=bad)
+        # 合法值与省略都能创建查询
+        self.assertIsNone(make_query().capacity)
+        self.assertIsNone(compile_query(SQL_FULL, capacity=None).capacity)
+        self.assertEqual(compile_query(SQL_FULL, capacity=1).capacity, 1)
+        self.assertEqual(compile_query(SQL_FULL, capacity=100).capacity, 100)
+
+    def test_new_key_rejected_when_full(self):
+        q = compile_query(SQL_FULL, capacity=2)
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 1_000, "amount": 1}), "included")
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 2_000, "amount": 2}), "included")
+        # 第三个新聚合键（窗口或 user_id 不同）被背压拒绝
+        self.assertEqual(q.push({"user_id": "u3", "event_time": 3_000, "amount": 3}), "backpressured")
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 11_000, "amount": 4}), "backpressured")
+        # 已有聚合键即使容量已满仍可累加
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 4_000, "amount": 5}), "included")
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 5_000, "amount": 6}), "included")
+        q.advance_watermark(10_000)
+        self.assertEqual(
+            q.drain(),
+            [
+                {"user_id": "u1", "window_start": "1970-01-01T00:00:00Z",
+                 "window_end": "1970-01-01T00:00:10Z", "total": 6},
+                {"user_id": "u2", "window_start": "1970-01-01T00:00:00Z",
+                 "window_end": "1970-01-01T00:00:10Z", "total": 8},
+            ],
+        )
+
+    def test_drain_frees_capacity(self):
+        q = compile_query(SQL_FULL, capacity=1)
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 1_000, "amount": 1}), "included")
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 1_000, "amount": 2}), "backpressured")
+        q.advance_watermark(10_000)
+        self.assertEqual(len(q.drain()), 1)
+        # drain 释放容量后，新聚合键可以被接收
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 11_000, "amount": 2}), "included")
+        q.advance_watermark(20_000)
+        self.assertEqual([r["user_id"] for r in q.drain()], ["u2"])
+
+    def test_late_takes_priority_over_backpressure(self):
+        q = compile_query(SQL_FULL, capacity=1)
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 1})
+        q.advance_watermark(10_000)
+        # 容量已满且记录迟到：优先返回 late
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 2_000, "amount": 2}), "late")
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 2_000, "amount": 2}), "late")
+
+    def test_backpressure_does_not_change_state_or_watermark(self):
+        q = compile_query(SQL_FULL, capacity=1)
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 5})
+        q.advance_watermark(5_000)
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 6_000, "amount": 9}), "backpressured")
+        self.assertEqual(q.watermark, 5_000)
+        # 被拒绝的记录没有进入聚合状态
+        q.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in q.drain()], [5])
+        self.assertEqual(q.drain(), [])
+        # 拒绝之后查询仍可正常处理后续记录
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 11_000, "amount": 9}), "included")
+
+    def test_unbounded_query_behavior_unchanged(self):
+        records = [
+            {"user_id": "u%d" % i, "event_time": (i % 3) * 1_000 + 1, "amount": i}
+            for i in range(50)
+        ]
+        results = []
+        for q in (make_query(), compile_query(SQL_FULL, capacity=None)):
+            for rec in records:
+                self.assertEqual(q.push(rec), "included")
+            q.advance_watermark(10_000)
+            results.append(q.drain())
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(len(results[0]), 50)
+
+    def test_deterministic_with_capacity(self):
+        records = [
+            {"user_id": "u1", "event_time": 1_000, "amount": 1},
+            {"user_id": "u2", "event_time": 2_000, "amount": 2},
+            {"user_id": "u3", "event_time": 3_000, "amount": 3},
+            {"user_id": "u1", "event_time": 4_000, "amount": 4},
+        ]
+        runs = []
+        for _ in range(2):
+            q = compile_query(SQL_FULL, capacity=2)
+            pushes = [q.push(rec) for rec in records]
+            q.advance_watermark(10_000)
+            runs.append((pushes, q.drain()))
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(runs[0][0], ["included", "included", "backpressured", "included"])
 
 
 class ErrorHandlingTest(unittest.TestCase):

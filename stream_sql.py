@@ -1,15 +1,16 @@
-"""流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进）。
+"""流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进、有界背压）。
 
 公开入口：
-    compile_query(sql) -> StreamQuery
+    compile_query(sql, capacity=None) -> StreamQuery
 
 StreamQuery:
-    push(record)            -> "included" | "late"
+    push(record)            -> "included" | "late" | "backpressured"
     advance_watermark(ts)   -> None
     drain()                 -> list[dict]
 
 异常：
     QuerySyntaxError          SQL 不合法
+    QueryConfigurationError   capacity 等查询配置不合法
     InvalidRecordError        记录缺字段 / 类型不符 / 时间无法解析
     WatermarkRegressionError  水位回退
 """
@@ -24,6 +25,7 @@ __all__ = [
     "compile_query",
     "StreamQuery",
     "QuerySyntaxError",
+    "QueryConfigurationError",
     "InvalidRecordError",
     "WatermarkRegressionError",
 ]
@@ -31,6 +33,10 @@ __all__ = [
 
 class QuerySyntaxError(Exception):
     """SQL 超出受支持的语法或语义范围。"""
+
+
+class QueryConfigurationError(Exception):
+    """查询配置（如 capacity）不合法。"""
 
 
 class InvalidRecordError(Exception):
@@ -335,9 +341,10 @@ def _user_id_sort_key(user_id):
 class StreamQuery:
     """由 compile_query 编译得到的可执行流式查询。"""
 
-    def __init__(self, columns, window_ms):
+    def __init__(self, columns, window_ms, capacity=None):
         self._columns = tuple(columns)  # ((kind, output_name), ...)
         self._window_ms = window_ms
+        self._capacity = capacity  # None 表示无界
         self._watermark_ms = None
         self._state = {}  # (window_start_ms, user_id) -> sum(amount)
 
@@ -350,12 +357,21 @@ class StreamQuery:
         return self._window_ms
 
     @property
+    def capacity(self):
+        """最大未输出聚合键数；None 表示无界。"""
+        return self._capacity
+
+    @property
     def watermark(self):
         """当前水位（UTC 毫秒），尚未推进过时为 None。"""
         return self._watermark_ms
 
     def push(self, record):
-        """摄入一条记录，返回 "included" 或 "late"。迟到记录不改变聚合状态。"""
+        """摄入一条记录，返回 "included"、"late" 或 "backpressured"。
+
+        迟到记录不改变聚合状态；因容量已满被背压拒绝的记录同样不改变
+        聚合状态、不产生结果，也不影响水位。
+        """
         if not isinstance(record, Mapping):
             raise InvalidRecordError("record must be a mapping of field name to value")
         for field in _SOURCE_FIELDS:
@@ -369,7 +385,11 @@ class StreamQuery:
             return "late"
         window_start = event_ms - (event_ms % self._window_ms)
         key = (window_start, user_id)
-        self._state[key] = self._state.get(key, 0) + amount
+        if key not in self._state:
+            if self._capacity is not None and len(self._state) >= self._capacity:
+                return "backpressured"
+            self._state[key] = 0
+        self._state[key] += amount
         return "included"
 
     def advance_watermark(self, timestamp):
@@ -411,7 +431,20 @@ class StreamQuery:
         return row
 
 
-def compile_query(sql):
+def _validate_capacity(capacity):
+    """capacity 省略或为 None 表示无界；否则必须是大于零的整数。"""
+    if capacity is None:
+        return None
+    if isinstance(capacity, bool) or not isinstance(capacity, int):
+        raise QueryConfigurationError(
+            "capacity must be a positive int or None, got %s" % type(capacity).__name__)
+    if capacity <= 0:
+        raise QueryConfigurationError(
+            "capacity must be a positive int, got %d" % capacity)
+    return capacity
+
+
+def compile_query(sql, capacity=None):
     """编译限定语法的窗口聚合 SQL，返回 StreamQuery。
 
     支持的形态（关键字与标识符大小写不敏感，空白不影响语义）：
@@ -422,10 +455,16 @@ def compile_query(sql):
                [SUM(amount) [AS alias]]
         FROM orders
         GROUP BY user_id, TUMBLE(event_time, INTERVAL n SECOND)
+
+    capacity 省略或为 None 时查询无界；给定正整数时表示查询可保留的
+    最大未输出聚合键数（聚合键由窗口起点与 user_id 确定）。容量已满时，
+    属于新聚合键的记录被背压拒绝（push 返回 "backpressured"）；
+    drain() 移除已确定聚合键后释放对应容量。
     """
+    capacity = _validate_capacity(capacity)
     if not isinstance(sql, str):
         raise QuerySyntaxError("sql must be a string, got %s" % type(sql).__name__)
     if not sql.strip():
         raise QuerySyntaxError("sql must not be empty")
     columns, window_ms = _Parser(_tokenize(sql)).parse()
-    return StreamQuery(columns, window_ms)
+    return StreamQuery(columns, window_ms, capacity)
