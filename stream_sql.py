@@ -1,10 +1,11 @@
-"""流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进、有界背压）。
+"""流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进、有界背压、Exactly-once 状态）。
 
 公开入口：
-    compile_query(sql, capacity=None) -> StreamQuery
+    compile_query(sql, capacity=None, state_path=None) -> StreamQuery
 
 StreamQuery:
     push(record)            -> "included" | "late" | "backpressured"
+                               （持久模式下还可能是 "duplicate"）
     advance_watermark(ts)   -> None
     drain()                 -> list[dict]
 
@@ -13,11 +14,15 @@ StreamQuery:
     QueryConfigurationError   capacity 等查询配置不合法
     InvalidRecordError        记录缺字段 / 类型不符 / 时间无法解析
     WatermarkRegressionError  水位回退
+    StateStorageError         state_path 不可用或状态文件损坏 / 不兼容
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
 
@@ -28,6 +33,7 @@ __all__ = [
     "QueryConfigurationError",
     "InvalidRecordError",
     "WatermarkRegressionError",
+    "StateStorageError",
 ]
 
 
@@ -45,6 +51,10 @@ class InvalidRecordError(Exception):
 
 class WatermarkRegressionError(Exception):
     """advance_watermark 试图回退水位。"""
+
+
+class StateStorageError(Exception):
+    """state_path 不可写，或状态文件损坏、版本不兼容、与 SQL / capacity 不一致。"""
 
 
 # ---------------------------------------------------------------------------
@@ -338,15 +348,152 @@ def _user_id_sort_key(user_id):
     return (1, 0, user_id)
 
 
+# ---------------------------------------------------------------------------
+# 状态持久化（Exactly-once）
+# ---------------------------------------------------------------------------
+
+_STATE_VERSION = 1
+
+
+def _validate_state_path(state_path):
+    """state_path 省略或为 None 表示内存模式；否则必须是非空字符串路径。"""
+    if state_path is None:
+        return None
+    if isinstance(state_path, bool) or not isinstance(state_path, str):
+        raise StateStorageError(
+            "state_path must be a non-empty string path, got %s" % type(state_path).__name__)
+    if not state_path:
+        raise StateStorageError("state_path must not be empty")
+    return state_path
+
+
+def _validate_payload(payload, path):
+    """校验状态文件内容结构；损坏或版本不兼容统一抛 StateStorageError。"""
+    def corrupted():
+        return StateStorageError("state file %r is corrupted" % path)
+
+    if not isinstance(payload, dict):
+        raise corrupted()
+    version = payload.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise corrupted()
+    if version != _STATE_VERSION:
+        raise StateStorageError(
+            "state file %r has unsupported version %r" % (path, version))
+    if not isinstance(payload.get("signature"), dict):
+        raise corrupted()
+    watermark = payload.get("watermark_ms")
+    if watermark is not None and (isinstance(watermark, bool) or not isinstance(watermark, int)):
+        raise corrupted()
+    entries = payload.get("state")
+    if not isinstance(entries, list):
+        raise corrupted()
+    for entry in entries:
+        if not (isinstance(entry, list) and len(entry) == 3):
+            raise corrupted()
+        window_start, user_id, total = entry
+        if isinstance(window_start, bool) or not isinstance(window_start, int):
+            raise corrupted()
+        if isinstance(user_id, bool) or not isinstance(user_id, (str, int)):
+            raise corrupted()
+        if isinstance(total, bool) or not isinstance(total, int):
+            raise corrupted()
+    seen_ids = payload.get("seen_ids")
+    if not isinstance(seen_ids, list) or any(not isinstance(rid, str) or not rid for rid in seen_ids):
+        raise corrupted()
+    return payload
+
+
+class _StateStore:
+    """state_path 的原子读写：完整状态快照写入同目录临时文件后 os.replace 落盘。
+
+    提交成功后只存在 state_path 本身，不留下日志或额外文件；中途失败
+    清理临时文件，已提交状态保持不变。
+    """
+
+    def __init__(self, path):
+        self._path = path
+
+    def load(self):
+        """读取并校验状态文件；文件不存在返回 None。"""
+        if not os.path.exists(self._path):
+            return None
+        try:
+            with open(self._path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            raise StateStorageError(
+                "cannot read state file %r: %s" % (self._path, exc)) from exc
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise StateStorageError("state file %r is corrupted" % self._path) from exc
+        return _validate_payload(payload, self._path)
+
+    def ensure_writable(self):
+        """确认已存在的状态文件可写（不修改内容）。"""
+        try:
+            with open(self._path, "ab"):
+                pass
+        except OSError as exc:
+            raise StateStorageError(
+                "state file %r is not writable: %s" % (self._path, exc)) from exc
+
+    def commit(self, payload):
+        """原子提交完整状态快照；失败抛 StateStorageError 且不留下部分更新。"""
+        data = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        directory = os.path.dirname(os.path.abspath(self._path))
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix=".stream_sql-", dir=directory)
+        except OSError as exc:
+            raise StateStorageError(
+                "cannot write state file %r: %s" % (self._path, exc)) from exc
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self._path)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise StateStorageError(
+                "cannot write state file %r: %s" % (self._path, exc)) from exc
+
+
 class StreamQuery:
     """由 compile_query 编译得到的可执行流式查询。"""
 
-    def __init__(self, columns, window_ms, capacity=None):
+    def __init__(self, columns, window_ms, capacity=None, state_path=None):
         self._columns = tuple(columns)  # ((kind, output_name), ...)
         self._window_ms = window_ms
         self._capacity = capacity  # None 表示无界
         self._watermark_ms = None
         self._state = {}  # (window_start_ms, user_id) -> sum(amount)
+        self._seen_ids = set()  # 已处理的 record_id（仅持久模式使用）
+        self._store = None
+        if state_path is not None:
+            store = _StateStore(state_path)
+            payload = store.load()
+            if payload is None:
+                # 初始化状态文件，同时验证路径可写。
+                store.commit(self._serialize_state())
+            else:
+                if payload["signature"] != self._signature():
+                    raise StateStorageError(
+                        "state file %r does not match this SQL and capacity" % state_path)
+                self._watermark_ms = payload["watermark_ms"]
+                self._state = {
+                    (window_start, user_id): total
+                    for window_start, user_id, total in payload["state"]
+                }
+                self._seen_ids = set(payload["seen_ids"])
+                store.ensure_writable()
+            self._store = store
 
     @property
     def columns(self):
@@ -366,30 +513,83 @@ class StreamQuery:
         """当前水位（UTC 毫秒），尚未推进过时为 None。"""
         return self._watermark_ms
 
+    @property
+    def persistent(self):
+        """是否启用状态持久化（构造时传入了 state_path）。"""
+        return self._store is not None
+
+    def _signature(self):
+        """查询的确定性签名，用于校验状态文件与 SQL、capacity 是否一致。"""
+        return {
+            "columns": [[kind, name] for kind, name in self._columns],
+            "window_ms": self._window_ms,
+            "capacity": self._capacity,
+        }
+
+    def _serialize_state(self):
+        entries = [
+            [window_start, user_id, total]
+            for (window_start, user_id), total in self._state.items()
+        ]
+        entries.sort(key=lambda item: (item[0], _user_id_sort_key(item[1])))
+        return {
+            "version": _STATE_VERSION,
+            "signature": self._signature(),
+            "watermark_ms": self._watermark_ms,
+            "state": entries,
+            "seen_ids": sorted(self._seen_ids),
+        }
+
+    def _snapshot(self):
+        return (self._watermark_ms, dict(self._state), set(self._seen_ids))
+
+    def _commit(self, snapshot):
+        """持久模式下原子提交当前状态；失败时回滚内存状态并抛 StateStorageError。"""
+        try:
+            self._store.commit(self._serialize_state())
+        except StateStorageError:
+            self._watermark_ms, self._state, self._seen_ids = snapshot
+            raise
+
     def push(self, record):
-        """摄入一条记录，返回 "included"、"late" 或 "backpressured"。
+        """摄入一条记录，返回 "included"、"late"、"backpressured" 或 "duplicate"。
 
         迟到记录不改变聚合状态；因容量已满被背压拒绝的记录同样不改变
-        聚合状态、不产生结果，也不影响水位。
+        聚合状态、不产生结果，也不影响水位。持久模式下记录必须携带非空
+        字符串 record_id；已处理过的 record_id 再次出现时不改变任何状态，
+        返回 "duplicate"（优先于 late 与 backpressured 判定）。
         """
         if not isinstance(record, Mapping):
             raise InvalidRecordError("record must be a mapping of field name to value")
-        for field in _SOURCE_FIELDS:
+        required = _SOURCE_FIELDS + (("record_id",) if self._store is not None else ())
+        for field in required:
             if field not in record:
                 raise InvalidRecordError("record is missing field %r" % field)
         user_id = _validate_user_id(record["user_id"])
         event_ms = _parse_timestamp(record["event_time"], InvalidRecordError)
         amount = _validate_amount(record["amount"])
+        record_id = None
+        if self._store is not None:
+            record_id = record["record_id"]
+            if not isinstance(record_id, str) or not record_id:
+                raise InvalidRecordError("record_id must be a non-empty string")
+            if record_id in self._seen_ids:
+                return "duplicate"
 
         if self._watermark_ms is not None and event_ms < self._watermark_ms:
             return "late"
         window_start = event_ms - (event_ms % self._window_ms)
         key = (window_start, user_id)
+        snapshot = self._snapshot() if self._store is not None else None
         if key not in self._state:
             if self._capacity is not None and len(self._state) >= self._capacity:
                 return "backpressured"
             self._state[key] = 0
         self._state[key] += amount
+        if record_id is not None:
+            self._seen_ids.add(record_id)
+        if snapshot is not None:
+            self._commit(snapshot)
         return "included"
 
     def advance_watermark(self, timestamp):
@@ -398,7 +598,10 @@ class StreamQuery:
         if self._watermark_ms is not None and ms < self._watermark_ms:
             raise WatermarkRegressionError(
                 "watermark cannot regress: %r is before current watermark" % (timestamp,))
+        snapshot = self._snapshot() if self._store is not None else None
         self._watermark_ms = ms
+        if snapshot is not None:
+            self._commit(snapshot)
 
     def drain(self):
         """返回所有已确定（窗口结束时刻不超过当前水位）的结果，并从状态中移除。"""
@@ -411,10 +614,15 @@ class StreamQuery:
         ]
         ready.sort(key=lambda item: (
             item[0], item[0] + self._window_ms, _user_id_sort_key(item[1])))
+        if not ready:
+            return []
+        snapshot = self._snapshot() if self._store is not None else None
         rows = []
         for window_start, user_id in ready:
             total = self._state.pop((window_start, user_id))
             rows.append(self._build_row(window_start, user_id, total))
+        if snapshot is not None:
+            self._commit(snapshot)
         return rows
 
     def _build_row(self, window_start, user_id, total):
@@ -444,7 +652,7 @@ def _validate_capacity(capacity):
     return capacity
 
 
-def compile_query(sql, capacity=None):
+def compile_query(sql, capacity=None, state_path=None):
     """编译限定语法的窗口聚合 SQL，返回 StreamQuery。
 
     支持的形态（关键字与标识符大小写不敏感，空白不影响语义）：
@@ -460,6 +668,14 @@ def compile_query(sql, capacity=None):
     最大未输出聚合键数（聚合键由窗口起点与 user_id 确定）。容量已满时，
     属于新聚合键的记录被背压拒绝（push 返回 "backpressured"）；
     drain() 移除已确定聚合键后释放对应容量。
+
+    state_path 省略或为 None 时查询为纯内存语义；给定非空字符串路径时
+    启用 Exactly-once 状态：push、advance_watermark、drain 的每次状态
+    变更都原子提交到该文件，使用同一 SQL、capacity 和 state_path 重新
+    构造查询即可恢复未输出窗口、当前水位与去重信息。持久模式下每条
+    记录必须携带非空字符串 record_id，已处理过的 record_id 再次被
+    推送时返回 "duplicate" 且不改变状态。state_path 不可写、状态文件
+    损坏、版本不兼容或与 SQL、capacity 不一致时抛 StateStorageError。
     """
     capacity = _validate_capacity(capacity)
     if not isinstance(sql, str):
@@ -467,4 +683,5 @@ def compile_query(sql, capacity=None):
     if not sql.strip():
         raise QuerySyntaxError("sql must not be empty")
     columns, window_ms = _Parser(_tokenize(sql)).parse()
-    return StreamQuery(columns, window_ms, capacity)
+    state_path = _validate_state_path(state_path)
+    return StreamQuery(columns, window_ms, capacity, state_path)

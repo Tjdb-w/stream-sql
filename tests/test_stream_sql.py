@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 
 from stream_sql import (
@@ -6,6 +9,7 @@ from stream_sql import (
     QueryConfigurationError,
     InvalidRecordError,
     WatermarkRegressionError,
+    StateStorageError,
 )
 
 SQL_FULL = """
@@ -342,6 +346,211 @@ class ErrorHandlingTest(unittest.TestCase):
         self.assertEqual([r["total"] for r in rows], [5])
         q.advance_watermark(20_000)
         self.assertEqual([r["total"] for r in q.drain()], [7])
+
+
+class PersistentStateTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_path = os.path.join(self._tmp.name, "state.json")
+
+    def make_persistent(self, sql=SQL_FULL, capacity=None):
+        return compile_query(sql, capacity=capacity, state_path=self.state_path)
+
+    @staticmethod
+    def rec(record_id, user_id, event_time, amount):
+        return {"record_id": record_id, "user_id": user_id,
+                "event_time": event_time, "amount": amount}
+
+    def test_restart_recovers_windows_and_watermark(self):
+        q = self.make_persistent()
+        self.assertEqual(q.push(self.rec("r1", "u1", 1_000, 5)), "included")
+        self.assertEqual(q.push(self.rec("r2", "u1", 9_999, 7)), "included")
+        self.assertEqual(q.push(self.rec("r3", "u2", 11_000, 3)), "included")
+        q.advance_watermark(10_000)
+
+        reopened = self.make_persistent()
+        self.assertEqual(reopened.watermark, 10_000)
+        rows = reopened.drain()  # 第一个窗口恢复并可输出
+        self.assertEqual(rows, [
+            {"user_id": "u1", "window_start": "1970-01-01T00:00:00Z",
+             "window_end": "1970-01-01T00:00:10Z", "total": 12},
+        ])
+        self.assertEqual(reopened.drain(), [])
+
+        # 再次重启：已 drain 的窗口不会重复返回，未确定的窗口仍在
+        reopened2 = self.make_persistent()
+        self.assertEqual(reopened2.drain(), [])
+        reopened2.advance_watermark(20_000)
+        rows = reopened2.drain()
+        self.assertEqual([r["user_id"] for r in rows], ["u2"])
+        self.assertEqual(rows[0]["total"], 3)
+        self.assertEqual(rows[0]["window_start"], "1970-01-01T00:00:10Z")
+
+    def test_drained_results_not_repeated_after_restart(self):
+        q = self.make_persistent()
+        q.push(self.rec("r1", "u1", 1_000, 5))
+        q.advance_watermark(10_000)
+        self.assertEqual(len(q.drain()), 1)
+        reopened = self.make_persistent()
+        self.assertEqual(reopened.drain(), [])
+
+    def test_duplicate_records_are_not_counted(self):
+        q = self.make_persistent()
+        self.assertEqual(q.push(self.rec("r1", "u1", 1_000, 5)), "included")
+        # 相同 record_id：无论事件时间如何都不再累加
+        self.assertEqual(q.push(self.rec("r1", "u1", 1_000, 5)), "duplicate")
+        self.assertEqual(q.push(self.rec("r1", "u2", 2_000, 99)), "duplicate")
+        self.assertEqual(q.push(self.rec("r1", "u1", 11_000, 99)), "duplicate")
+        q.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in q.drain()], [5])
+
+    def test_duplicate_takes_priority_over_late_and_backpressure(self):
+        q = self.make_persistent(capacity=1)
+        q.push(self.rec("r1", "u1", 1_000, 1))
+        q.advance_watermark(10_000)
+        # 容量已满且事件时间迟到，但 record_id 已处理：返回 duplicate
+        self.assertEqual(q.push(self.rec("r1", "u2", 2_000, 2)), "duplicate")
+        self.assertEqual(q.push(self.rec("r2", "u2", 2_000, 2)), "late")
+        self.assertEqual(q.push(self.rec("r3", "u2", 12_000, 2)), "backpressured")
+
+    def test_duplicate_detection_survives_restart(self):
+        q = self.make_persistent()
+        q.push(self.rec("r1", "u1", 1_000, 5))
+        reopened = self.make_persistent()
+        self.assertEqual(reopened.push(self.rec("r1", "u1", 1_000, 5)), "duplicate")
+        reopened.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in reopened.drain()], [5])
+
+    def test_late_and_backpressured_ids_can_be_retried(self):
+        q = self.make_persistent(capacity=1)
+        q.push(self.rec("r1", "u1", 1_000, 1))
+        q.advance_watermark(10_000)
+        # 迟到与背压的记录未被处理，其 record_id 不进入去重集合
+        self.assertEqual(q.push(self.rec("r2", "u1", 2_000, 2)), "late")
+        self.assertEqual(q.push(self.rec("r2", "u1", 2_000, 2)), "late")
+        self.assertEqual(q.push(self.rec("r3", "u2", 12_000, 3)), "backpressured")
+        q.drain()  # 释放容量
+        self.assertEqual(q.push(self.rec("r3", "u2", 12_000, 3)), "included")
+        q.advance_watermark(20_000)
+        self.assertEqual([r["total"] for r in q.drain()], [3])
+
+    def test_record_id_validation(self):
+        q = self.make_persistent()
+        bad_records = [
+            {"user_id": "u1", "event_time": 0, "amount": 1},  # 缺 record_id
+            self.rec("", "u1", 0, 1),  # 空字符串
+            self.rec(None, "u1", 0, 1),
+            self.rec(123, "u1", 0, 1),  # 非字符串
+            self.rec(True, "u1", 0, 1),
+            self.rec(["r"], "u1", 0, 1),
+        ]
+        for rec in bad_records:
+            with self.assertRaises(InvalidRecordError, msg=repr(rec)):
+                q.push(rec)
+        # 校验失败后查询仍可正常使用
+        self.assertEqual(q.push(self.rec("r1", "u1", 0, 1)), "included")
+
+    def test_memory_mode_ignores_record_id(self):
+        q = make_query()
+        # 不带 record_id 仍按原规则处理
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 0, "amount": 1}), "included")
+        # 携带 record_id 不改变内存模式的输入判定，也不触发去重
+        rec = {"record_id": "r1", "user_id": "u1", "event_time": 1_000, "amount": 2}
+        self.assertEqual(q.push(rec), "included")
+        self.assertEqual(q.push(dict(rec)), "included")
+        q.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in q.drain()], [5])
+
+    def test_state_path_validation(self):
+        for bad in ("", 0, 1.5, True, [], object()):
+            with self.assertRaises(StateStorageError, msg=repr(bad)):
+                compile_query(SQL_FULL, state_path=bad)
+        # 父目录不存在：不隐式创建目录
+        with self.assertRaises(StateStorageError):
+            compile_query(SQL_FULL, state_path=os.path.join(self._tmp.name, "nope", "s.json"))
+        # state_path 指向目录
+        with self.assertRaises(StateStorageError):
+            compile_query(SQL_FULL, state_path=self._tmp.name)
+        # 省略与 None 都是内存模式
+        self.assertIsNotNone(make_query())
+        self.assertIsNotNone(compile_query(SQL_FULL, state_path=None))
+
+    def test_corrupted_or_incompatible_state_file(self):
+        with open(self.state_path, "wb") as handle:
+            handle.write(b"not json at all")
+        with self.assertRaises(StateStorageError):
+            self.make_persistent()
+
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 999, "signature": {}, "watermark_ms": None,
+                       "state": [], "seen_ids": []}, handle)
+        with self.assertRaises(StateStorageError):
+            self.make_persistent()
+
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "signature": {}, "watermark_ms": "soon",
+                       "state": [], "seen_ids": []}, handle)
+        with self.assertRaises(StateStorageError):
+            self.make_persistent()
+
+    def test_sql_or_capacity_mismatch(self):
+        self.make_persistent(capacity=2)
+        with self.assertRaises(StateStorageError):
+            self.make_persistent(capacity=3)
+        with self.assertRaises(StateStorageError):
+            self.make_persistent()  # 持久化时 capacity=2，现在为 None
+        with self.assertRaises(StateStorageError):
+            self.make_persistent(sql=(
+                "SELECT user_id, SUM(amount) AS total FROM orders "
+                "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)"))
+        # 同一 SQL 与 capacity 可以正常恢复
+        self.assertIsNotNone(self.make_persistent(capacity=2))
+
+    def test_failed_commit_rolls_back_and_keeps_committed_state(self):
+        q = self.make_persistent()
+        q.push(self.rec("r1", "u1", 1_000, 5))
+        q.advance_watermark(10_000)
+        # 破坏 state_path（替换成目录），使后续提交失败
+        os.unlink(self.state_path)
+        os.mkdir(self.state_path)
+        with self.assertRaises(StateStorageError):
+            q.push(self.rec("r2", "u1", 12_000, 7))
+        with self.assertRaises(StateStorageError):
+            q.advance_watermark(20_000)
+        # 内存状态已回滚：水位不变，r2 未计入，也未进入去重集合
+        self.assertEqual(q.watermark, 10_000)
+        # 恢复路径后提交重新可用，且没有部分更新
+        os.rmdir(self.state_path)
+        self.assertEqual(q.push(self.rec("r2", "u1", 12_000, 7)), "included")
+        rows = q.drain()  # 水位 10_000 只能确定第一个窗口
+        self.assertEqual([r["total"] for r in rows], [5])
+        q.advance_watermark(20_000)
+        self.assertEqual([r["total"] for r in q.drain()], [7])
+        reopened = self.make_persistent()
+        self.assertEqual(reopened.drain(), [])
+
+    def test_only_state_file_is_created(self):
+        q = self.make_persistent()
+        q.push(self.rec("r1", "u1", 1_000, 5))
+        q.advance_watermark(10_000)
+        q.drain()
+        self.assertEqual(os.listdir(self._tmp.name), ["state.json"])
+
+    def test_persistent_and_memory_modes_agree(self):
+        records = [
+            {"user_id": "u%d" % i, "event_time": (i % 3) * 1_000 + 1, "amount": i}
+            for i in range(20)
+        ]
+        memory = make_query()
+        persistent = self.make_persistent()
+        for i, rec in enumerate(records):
+            expected = memory.push(rec)
+            actual = persistent.push(dict(rec, record_id="r%d" % i))
+            self.assertEqual(actual, expected)
+        memory.advance_watermark(10_000)
+        persistent.advance_watermark(10_000)
+        self.assertEqual(persistent.drain(), memory.drain())
 
 
 if __name__ == "__main__":
