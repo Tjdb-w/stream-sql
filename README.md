@@ -8,8 +8,8 @@
 
 ## 状态
 
-已实现：由乱序水位推进的事件时间翻滚窗口 SQL 聚合、有界背压控制与
-Exactly-once 状态（持久化、重启恢复、记录去重）
+已实现：由乱序水位推进的事件时间翻滚（TUMBLE）/滑动（HOP）窗口 SQL 聚合、
+有界背压控制与 Exactly-once 状态（持久化、重启恢复、记录去重）
 （`stream_sql.py`，仅标准库，无外部依赖）。
 
 ## 公开接口
@@ -39,11 +39,30 @@ FROM orders
 GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 ```
 
+滑动窗口使用 `HOP`，窗口长度 `size`、滑动步长 `slide`：
+
+```sql
+SELECT user_id,
+       HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_start,
+       HOP_END(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_end,
+       SUM(amount) AS total
+FROM orders
+GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)
+```
+
 - 数据源固定为 `orders`，可用字段限定为 `user_id`、`event_time`、`amount`。
-- `user_id` 必选；`TUMBLE_START`、`TUMBLE_END`、`SUM(amount)` 为可选别名列，
-  未给别名时输出列名依次为 `window_start`、`window_end`、`sum_amount`。
-- 窗口间隔必须是正的秒数；`TUMBLE_START`/`TUMBLE_END` 的间隔须与 `TUMBLE` 一致。
-- 窗口左闭右开，按 epoch 对齐。
+- `user_id` 必选；`TUMBLE_START`/`TUMBLE_END`、`HOP_START`/`HOP_END`、
+  `SUM(amount)` 为可选别名列，未给别名时输出列名依次为
+  `window_start`、`window_end`、`sum_amount`。
+- 窗口间隔必须是正的秒数；边界函数（`TUMBLE_START`/`TUMBLE_END` 或
+  `HOP_START`/`HOP_END`）的参数须与分组窗口一致。
+- TUMBLE 窗口左闭右开，按窗口长度（epoch）对齐。
+- HOP 的 `size`、`slide` 为正整数秒且 `slide` 不大于 `size`；窗口左闭右开，
+  按 `slide`（epoch）对齐。一条记录落入满足 `window_start <= event_time <
+  window_start + size` 且 `window_start` 为 `slide` 整数倍的全部窗口，因此会
+  同时进入多个聚合键；`slide = size` 时 HOP 与 TUMBLE 等价。
+- 同一查询只能使用一种窗口：混用 TUMBLE 与 HOP、边界函数参数与分组不一致、
+  `slide > size`，或出现不支持的表达式时，`compile_query` 抛 `QuerySyntaxError`。
 
 ### 记录与水位
 
@@ -63,12 +82,14 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 
 - `compile_query(sql, capacity=...)` 的 `capacity` 省略或为 `None` 时查询无界；
   给定正整数时表示查询可保留的最大未输出聚合键数
-  （聚合键由窗口起点与 `user_id` 确定）。
+  （聚合键由窗口起点与 `user_id` 确定）。HOP 下一条记录会进入多个窗口，
+  其对应的每个 `(window_start, user_id)` 各占一个名额。
 - `capacity` 只接受大于零的整数；`bool`、零、负数和其他类型都抛出
   `QueryConfigurationError`，且不创建查询实例。
-- 合法记录属于已存在的聚合键时，即使容量已满也返回 `"included"` 并累加；
-  属于新聚合键且容量已满时返回 `"backpressured"`，不修改聚合状态、
-  不产生结果，也不改变水位。
+- 合法记录的所有目标键均已存在时，即使容量已满也返回 `"included"` 并累加；
+  只要会引入一个放不下的新聚合键，整条记录即返回 `"backpressured"`
+  （HOP 下必须全部新键都能容纳才接收），不做部分累加，不修改聚合状态、
+  不产生结果、不登记 `record_id`，也不改变水位。
 - 合法但迟到的记录优先返回 `"late"`，不因容量已满变成 `"backpressured"`。
 - 推进水位本身不释放容量；`drain()` 移除已确定聚合键后释放对应容量，
   后续新聚合键即可被接收。
@@ -84,7 +105,9 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
   不额外创建日志或隐式目录。
 - 使用同一 SQL（语义等价即可）、同一 `capacity` 和同一 `state_path` 重新构造查询，
   即可恢复未输出窗口、当前水位与去重信息，继续 `push` / `drain`；
-  已成功 `drain` 返回的窗口不会在重启后重复返回。
+  已成功 `drain` 返回的窗口不会在重启后重复返回。状态指纹区分窗口类型
+  （TUMBLE/HOP）、`size` 与 `slide`，HOP 的多个窗口、水位与去重信息在同一
+  原子文件中保存。
 - 持久模式下每条记录必须带非空字符串 `record_id`，缺失或类型不符抛出
   `InvalidRecordError`。同一查询状态内已处理（`included` 或 `late`）的
   `record_id` 再次出现时，无论事件时间、容量或水位如何都返回 `"duplicate"`，
@@ -98,7 +121,8 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 ### 异常
 
 - `QuerySyntaxError`：SQL 出现限定字段之外的字段、不支持的表达式，
-  或窗口间隔不是正的秒数。
+  窗口间隔不是正的秒数，HOP 的 `slide` 大于 `size`，混用 TUMBLE 与 HOP，
+  或窗口边界函数参数与分组窗口不一致。
 - `QueryConfigurationError`：`capacity` 不是大于零的整数或 `None`。
 - `InvalidRecordError`：记录缺少字段、类型不符或时间无法解析
   （`advance_watermark` 的时间参数无法解析时同样抛出）。

@@ -1,4 +1,4 @@
-"""流式 SQL 计算引擎：事件时间翻滚窗口聚合（乱序水位推进、有界背压、Exactly-once 状态）。
+"""流式 SQL 计算引擎：事件时间翻滚/滑动窗口聚合（乱序水位推进、有界背压、Exactly-once 状态）。
 
 公开入口：
     compile_query(sql, capacity=None, state_path=None) -> StreamQuery
@@ -124,7 +124,8 @@ _TOKEN_RE = re.compile(
 
 _KEYWORDS = frozenset({
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "AS",
-    "AND", "OR", "NOT", "TUMBLE", "TUMBLE_START", "TUMBLE_END", "SUM",
+    "AND", "OR", "NOT", "TUMBLE", "TUMBLE_START", "TUMBLE_END",
+    "HOP", "HOP_START", "HOP_END", "SUM",
     "INTERVAL", "SECOND", "ORDERS",
 })
 
@@ -158,10 +159,16 @@ def _tokenize(sql):
 # select_item := ( user_id
 #                | TUMBLE_START '(' event_time ',' interval ')'
 #                | TUMBLE_END   '(' event_time ',' interval ')'
+#                | HOP_START '(' event_time ',' interval ',' interval ')'
+#                | HOP_END   '(' event_time ',' interval ',' interval ')'
 #                | SUM '(' amount ')' ) [ [AS] alias ]
-# group_list  := user_id ',' TUMBLE '(' event_time ',' interval ')'
-#                （两项顺序可互换）
+# group_list  := user_id ',' window_spec （两项顺序可互换）
+# window_spec := TUMBLE '(' event_time ',' interval ')'
+#              | HOP    '(' event_time ',' interval ',' interval ')'
 # interval    := INTERVAL ( number | 'number' ) SECOND
+#
+# 一条查询只能有一种窗口（TUMBLE 或 HOP）；HOP 的窗口边界函数
+# (HOP_START/HOP_END) 的 size、slide 必须与 HOP 分组一致。
 # ---------------------------------------------------------------------------
 
 class _Parser:
@@ -203,7 +210,7 @@ class _Parser:
         self._expect_field("orders")
         self._expect_keyword("GROUP")
         self._expect_keyword("BY")
-        window_ms = self._parse_group_list()
+        window_type, size_ms, slide_ms = self._parse_group_list()
         kind, text = self._peek()
         if kind == "punct" and text == ";":
             self._next()
@@ -211,10 +218,12 @@ class _Parser:
         if kind is not None:
             raise QuerySyntaxError("unexpected trailing SQL: %r" % text)
 
+        window_spec = (window_type, size_ms, slide_ms)
         for item in select_items:
-            if item[1] in ("window_start", "window_end") and item[2] != window_ms:
+            if item[1] in ("window_start", "window_end") and item[2] != window_spec:
                 raise QuerySyntaxError(
-                    "%s interval must match the TUMBLE window interval" % item[1].upper())
+                    "%s parameters must match the %s window parameters"
+                    % (item[1].upper(), window_type.upper()))
 
         seen_names = set()
         columns = []
@@ -226,7 +235,7 @@ class _Parser:
             columns.append((col_kind, name))
         if not any(kind == "user_id" for kind, _ in columns):
             raise QuerySyntaxError("SELECT list must include user_id")
-        return columns, window_ms
+        return columns, window_type, size_ms, slide_ms
 
     def _parse_select_list(self):
         items = [self._parse_select_item()]
@@ -247,14 +256,24 @@ class _Parser:
             self._expect_field("amount")
             self._expect_punct(")")
             item = ("sum", "sum_amount", None)
-        elif upper in ("TUMBLE_START", "TUMBLE_END"):
+        elif upper in ("TUMBLE_START", "TUMBLE_END", "HOP_START", "HOP_END"):
             self._expect_punct("(")
             self._expect_field("event_time")
             self._expect_punct(",")
-            interval_ms = self._parse_interval()
+            if upper.startswith("HOP"):
+                size_ms = self._parse_interval()
+                self._expect_punct(",")
+                slide_ms = self._parse_interval()
+                if slide_ms > size_ms:
+                    raise QuerySyntaxError(
+                        "HOP slide interval must not be greater than size interval")
+                spec = ("hop", size_ms, slide_ms)
+            else:
+                interval_ms = self._parse_interval()
+                spec = ("tumble", interval_ms, interval_ms)
             self._expect_punct(")")
-            col_kind = "window_start" if upper == "TUMBLE_START" else "window_end"
-            item = ("tumble_bound", col_kind, interval_ms)
+            col_kind = "window_start" if upper.endswith("_START") else "window_end"
+            item = ("window_bound", col_kind, spec)
         else:
             raise QuerySyntaxError("unsupported select expression: %r" % text)
 
@@ -292,7 +311,7 @@ class _Parser:
 
     def _parse_group_list(self):
         saw_user_id = False
-        window_ms = None
+        window = None  # (window_type, size_ms, slide_ms)
         while True:
             kind, text = self._next()
             if kind != "ident":
@@ -302,14 +321,24 @@ class _Parser:
                 if saw_user_id:
                     raise QuerySyntaxError("duplicate GROUP BY user_id")
                 saw_user_id = True
-            elif upper == "TUMBLE":
-                if window_ms is not None:
-                    raise QuerySyntaxError("duplicate TUMBLE in GROUP BY")
+            elif upper in ("TUMBLE", "HOP"):
+                if window is not None:
+                    raise QuerySyntaxError(
+                        "duplicate %s in GROUP BY" % window[0].upper())
+                window_type = upper.lower()
                 self._expect_punct("(")
                 self._expect_field("event_time")
                 self._expect_punct(",")
-                window_ms = self._parse_interval()
+                size_ms = self._parse_interval()
+                slide_ms = size_ms
+                if window_type == "hop":
+                    self._expect_punct(",")
+                    slide_ms = self._parse_interval()
+                    if slide_ms > size_ms:
+                        raise QuerySyntaxError(
+                            "HOP slide interval must not be greater than size interval")
                 self._expect_punct(")")
+                window = (window_type, size_ms, slide_ms)
             else:
                 raise QuerySyntaxError("unsupported GROUP BY expression: %r" % text)
             if self._peek() == ("punct", ","):
@@ -318,9 +347,11 @@ class _Parser:
             break
         if not saw_user_id:
             raise QuerySyntaxError("GROUP BY must include user_id")
-        if window_ms is None:
-            raise QuerySyntaxError("GROUP BY must include TUMBLE(event_time, INTERVAL n SECOND)")
-        return window_ms
+        if window is None:
+            raise QuerySyntaxError(
+                "GROUP BY must include TUMBLE(event_time, INTERVAL n SECOND) "
+                "or HOP(event_time, INTERVAL size SECOND, INTERVAL slide SECOND)")
+        return window
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +386,7 @@ def _user_id_sort_key(user_id):
 # 回滚到变更前，已提交状态保持不变。
 # ---------------------------------------------------------------------------
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 
 
 def _validate_state_user_id(value, path):
@@ -367,9 +398,12 @@ def _validate_state_user_id(value, path):
 class StreamQuery:
     """由 compile_query 编译得到的可执行流式查询。"""
 
-    def __init__(self, columns, window_ms, capacity=None, state_path=None):
+    def __init__(self, columns, window_type, size_ms, slide_ms,
+                 capacity=None, state_path=None):
         self._columns = tuple(columns)  # ((kind, output_name), ...)
-        self._window_ms = window_ms
+        self._window_type = window_type  # "tumble" | "hop"
+        self._size_ms = size_ms
+        self._slide_ms = slide_ms
         self._capacity = capacity  # None 表示无界
         self._watermark_ms = None
         self._state = {}  # (window_start_ms, user_id) -> sum(amount)
@@ -381,8 +415,22 @@ class StreamQuery:
         return tuple(name for _, name in self._columns)
 
     @property
+    def window_type(self):
+        """窗口类型："tumble"（翻滚）或 "hop"（滑动）。"""
+        return self._window_type
+
+    @property
+    def size_ms(self):
+        return self._size_ms
+
+    @property
+    def slide_ms(self):
+        return self._slide_ms
+
+    @property
     def window_ms(self):
-        return self._window_ms
+        """窗口长度（毫秒）。"""
+        return self._size_ms
 
     @property
     def capacity(self):
@@ -394,11 +442,29 @@ class StreamQuery:
         """当前水位（UTC 毫秒），尚未推进过时为 None。"""
         return self._watermark_ms
 
+    def _window_starts_for(self, event_ms):
+        """返回事件落入的所有窗口起点（升序）。
+
+        窗口左闭右开、按 slide 对齐：window_start <= event_ms <
+        window_start + size，且 window_start 为 slide 的整数倍。
+        TUMBLE 等价于 slide == size，恰好落入一个窗口。
+        """
+        latest = event_ms - (event_ms % self._slide_ms)
+        starts = []
+        start = latest
+        while start + self._size_ms > event_ms:
+            starts.append(start)
+            start -= self._slide_ms
+        starts.reverse()
+        return starts
+
     def push(self, record):
         """摄入一条记录，返回 "included"、"late" 或 "backpressured"。
 
         迟到记录不改变聚合状态；因容量已满被背压拒绝的记录同样不改变
-        聚合状态、不产生结果，也不影响水位。
+        聚合状态、不产生结果，也不影响水位。HOP 记录会落入多个窗口，
+        只有当这些窗口对应的全部新聚合键都能被 capacity 容纳时才写入，
+        否则整条记录背压，不做部分累加。
 
         持久模式（构造时给定 state_path）下每条记录还须带非空字符串
         record_id；已处理过的 record_id 再次出现时返回 "duplicate"，
@@ -433,24 +499,38 @@ class StreamQuery:
                     self._seen_ids.discard(record_id)
                     raise
             return "late"
-        window_start = event_ms - (event_ms % self._window_ms)
-        key = (window_start, user_id)
-        created = key not in self._state
-        if created:
-            if self._capacity is not None and len(self._state) >= self._capacity:
+
+        targets = [
+            (window_start, user_id)
+            for window_start in self._window_starts_for(event_ms)
+        ]
+        # 容量预检：所有目标键（含已有键）都必须能被容纳，否则整条拒绝，
+        # 不允许部分累加。
+        if self._capacity is not None:
+            distinct_new = {key for key in targets if key not in self._state}
+            if len(self._state) + len(distinct_new) > self._capacity:
                 return "backpressured"
-            self._state[key] = 0
-        self._state[key] += amount
+
+        snapshot = None
+        if persistent:
+            # 提交失败时按快照精确回滚（HOP 可能新建多个键）。
+            snapshot = {key: self._state.get(key) for key in targets}
+        for key in targets:
+            if key in self._state:
+                self._state[key] += amount
+            else:
+                self._state[key] = amount
         if persistent:
             self._seen_ids.add(record_id)
             try:
                 self._commit()
             except StateStorageError:
                 self._seen_ids.discard(record_id)
-                if created:
-                    del self._state[key]
-                else:
-                    self._state[key] -= amount
+                for key, previous in snapshot.items():
+                    if previous is None:
+                        del self._state[key]
+                    else:
+                        self._state[key] = previous
                 raise
         return "included"
 
@@ -478,10 +558,10 @@ class StreamQuery:
         ready = [
             (window_start, user_id)
             for (window_start, user_id) in self._state
-            if window_start + self._window_ms <= self._watermark_ms
+            if window_start + self._size_ms <= self._watermark_ms
         ]
         ready.sort(key=lambda item: (
-            item[0], item[0] + self._window_ms, _user_id_sort_key(item[1])))
+            item[0], item[0] + self._size_ms, _user_id_sort_key(item[1])))
         rows = []
         removed = []
         for window_start, user_id in ready:
@@ -505,7 +585,7 @@ class StreamQuery:
             elif kind == "window_start":
                 row[name] = _format_iso8601(window_start)
             elif kind == "window_end":
-                row[name] = _format_iso8601(window_start + self._window_ms)
+                row[name] = _format_iso8601(window_start + self._size_ms)
             else:  # sum_amount
                 row[name] = total
         return row
@@ -518,7 +598,9 @@ class StreamQuery:
         """查询指纹：同一 SQL 语义与 capacity 得到同一指纹。"""
         return {
             "columns": [[kind, name] for kind, name in self._columns],
-            "window_ms": self._window_ms,
+            "window_type": self._window_type,
+            "size_ms": self._size_ms,
+            "slide_ms": self._slide_ms,
             "capacity": self._capacity,
         }
 
@@ -647,10 +729,29 @@ def compile_query(sql, capacity=None, state_path=None):
         FROM orders
         GROUP BY user_id, TUMBLE(event_time, INTERVAL n SECOND)
 
+    滑动窗口形态：
+
+        SELECT user_id,
+               [HOP_START(event_time, INTERVAL size SECOND,
+                          INTERVAL slide SECOND) [AS alias],]
+               [HOP_END(event_time, INTERVAL size SECOND,
+                        INTERVAL slide SECOND) [AS alias],]
+               [SUM(amount) [AS alias]]
+        FROM orders
+        GROUP BY user_id,
+                 HOP(event_time, INTERVAL size SECOND, INTERVAL slide SECOND)
+
+    size、slide 必须为正整数秒且 slide 不大于 size；每条记录会落入
+    window_start <= event_time < window_start + size、且 window_start 为
+    slide 整数倍的全部窗口（slide == size 时 HOP 与 TUMBLE 等价）。
+    HOP_START/HOP_END 的参数必须与 HOP 分组一致；同一查询不能混用
+    TUMBLE 与 HOP。
+
     capacity 省略或为 None 时查询无界；给定正整数时表示查询可保留的
-    最大未输出聚合键数（聚合键由窗口起点与 user_id 确定）。容量已满时，
-    属于新聚合键的记录被背压拒绝（push 返回 "backpressured"）；
-    drain() 移除已确定聚合键后释放对应容量。
+    最大未输出聚合键数（聚合键由窗口起点与 user_id 确定；HOP 下一条
+    记录同时进入多个聚合键，任一目标新键超容量即整条背压，不部分
+    累加）。容量已满时，属于新聚合键的记录被背压拒绝（push 返回
+    "backpressured"）；drain() 移除已确定聚合键后释放对应容量。
 
     state_path 省略或为 None 时查询为纯内存模式，行为与既往一致。
     给定 state_path 时查询进入持久模式：每次成功变更把完整状态原子
@@ -665,12 +766,13 @@ def compile_query(sql, capacity=None, state_path=None):
         raise QuerySyntaxError("sql must be a string, got %s" % type(sql).__name__)
     if not sql.strip():
         raise QuerySyntaxError("sql must not be empty")
-    columns, window_ms = _Parser(_tokenize(sql)).parse()
+    columns, window_type, size_ms, slide_ms = _Parser(_tokenize(sql)).parse()
     if state_path is None:
-        return StreamQuery(columns, window_ms, capacity)
+        return StreamQuery(columns, window_type, size_ms, slide_ms, capacity)
     if not isinstance(state_path, str) or not state_path:
         raise StateStorageError(
             "state_path must be a non-empty string path, got %r" % (state_path,))
-    query = StreamQuery(columns, window_ms, capacity, state_path=state_path)
+    query = StreamQuery(columns, window_type, size_ms, slide_ms, capacity,
+                        state_path=state_path)
     query._restore_or_initialize()
     return query

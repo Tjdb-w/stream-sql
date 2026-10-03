@@ -21,6 +21,21 @@ SQL_FULL = """
     GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 """
 
+HOP_SQL = """
+    SELECT user_id,
+           HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_start,
+           HOP_END(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_end,
+           SUM(amount) AS total
+    FROM orders
+    GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)
+"""
+
+HOP_SQL_SUMS = """
+    SELECT user_id, SUM(amount) AS total
+    FROM orders
+    GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)
+"""
+
 
 class StateTestCase(unittest.TestCase):
     def setUp(self):
@@ -293,6 +308,130 @@ class StateStorageErrorTest(StateTestCase):
         q.push({"user_id": "u1", "event_time": 11_000, "amount": 3, "record_id": "r1"})
         q.advance_watermark(20_000)
         self.assertEqual([r["total"] for r in q.drain()], [3])
+
+
+class HopPersistenceTest(StateTestCase):
+    def test_multi_window_state_is_persisted_and_recovered(self):
+        q = self.make_query(sql=HOP_SQL)
+        # t=7000 扇出 [0,10)、[5,15)
+        self.assertEqual(
+            q.push({"user_id": "u1", "event_time": 7_000, "amount": 4,
+                    "record_id": "r1"}),
+            "included")
+        doc = self.read_state_file()
+        self.assertEqual(
+            doc["fingerprint"],
+            {"columns": [["user_id", "user_id"],
+                         ["window_start", "window_start"],
+                         ["window_end", "window_end"],
+                         ["sum_amount", "total"]],
+             "window_type": "hop", "size_ms": 10_000, "slide_ms": 5_000,
+             "capacity": None})
+        self.assertEqual(sorted(w[0] for w in doc["windows"]), [0, 5_000])
+
+        q2 = self.make_query(sql=HOP_SQL)
+        q2.advance_watermark(10_000)
+        self.assertEqual(q2.drain(), [
+            {"user_id": "u1", "window_start": "1970-01-01T00:00:00Z",
+             "window_end": "1970-01-01T00:00:10Z", "total": 4},
+        ])
+        # 重启后未确定的 [5,15) 仍保留，已 drain 的窗口不重复
+        q3 = self.make_query(sql=HOP_SQL)
+        self.assertEqual(q3.drain(), [])
+        q3.advance_watermark(15_000)
+        self.assertEqual(q3.drain(), [
+            {"user_id": "u1", "window_start": "1970-01-01T00:00:05Z",
+             "window_end": "1970-01-01T00:00:15Z", "total": 4},
+        ])
+
+    def test_semantically_equivalent_hop_text_recovers(self):
+        q = self.make_query(sql=HOP_SQL_SUMS)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 3, "record_id": "r1"})
+        q2 = compile_query(
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id, hop( event_time , INTERVAL '10' SECOND , "
+            "INTERVAL 5 SECOND ) ;",
+            state_path=self.state_path)
+        q2.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in q2.drain()], [3])
+
+    def test_backpressured_multi_window_records_leave_no_trace(self):
+        q = self.make_query(sql=HOP_SQL_SUMS, capacity=2)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1, "record_id": "r1"})
+        blocked = {"user_id": "u2", "event_time": 7_000, "amount": 2,
+                   "record_id": "r2"}
+        self.assertEqual(q.push(blocked), "backpressured")
+        # 背压不登记 record_id、不落任何窗口（u1 仍占其扇出的两个窗口）
+        doc = self.read_state_file()
+        self.assertEqual(doc["seen_ids"], ["r1"])
+        self.assertEqual(sorted((w[0], w[1]) for w in doc["windows"]),
+                         [(0, "u1"), (5_000, "u1")])
+        q.advance_watermark(15_000)
+        q.drain()
+        # 同一 record_id 可在容量释放后重新摄入（取水位之后的事件时间）
+        blocked["event_time"] = 17_000
+        self.assertEqual(q.push(blocked), "included")
+        self.assertEqual(
+            q.push({"user_id": "u2", "event_time": 17_000, "amount": 2,
+                    "record_id": "r2"}),
+            "duplicate")
+
+    def test_failed_multi_window_commit_rolls_back_all_keys(self):
+        q = self.make_query(sql=HOP_SQL_SUMS)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1, "record_id": "r1"})
+        q.advance_watermark(10_000)
+        committed = self.read_state_file()
+        os.unlink(self.state_path)
+        os.mkdir(self.state_path)
+        # 该记录扇出 [5,15)（新键）与 [10,20)（新键），提交须整体失败
+        with self.assertRaises(StateStorageError):
+            q.push({"user_id": "u2", "event_time": 12_000, "amount": 2,
+                    "record_id": "r2"})
+        self.assertNotIn((5_000, "u2"), q._state)
+        self.assertNotIn((10_000, "u2"), q._state)
+        self.assertNotIn("r2", q._seen_ids)
+        os.rmdir(self.state_path)
+        q._commit()
+        self.assertEqual(self.read_state_file(), committed)
+        self.assertEqual(
+            q.push({"user_id": "u2", "event_time": 12_000, "amount": 2,
+                    "record_id": "r2"}),
+            "included")
+
+    def test_fingerprint_distinguishes_tumble_size_and_slide(self):
+        q = self.make_query(sql=HOP_SQL_SUMS)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1, "record_id": "r1"})
+        # HOP 状态不能用 TUMBLE 打开（即使 size 相同）
+        with self.assertRaises(StateStorageError):
+            compile_query(
+                "SELECT user_id, SUM(amount) AS total FROM orders "
+                "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
+                state_path=self.state_path)
+        # slide 不同
+        with self.assertRaises(StateStorageError):
+            self.make_query(sql=(
+                "SELECT user_id, SUM(amount) AS total FROM orders "
+                "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, "
+                "INTERVAL 2 SECOND)"))
+        # size 不同
+        with self.assertRaises(StateStorageError):
+            self.make_query(sql=(
+                "SELECT user_id, SUM(amount) AS total FROM orders "
+                "GROUP BY user_id, HOP(event_time, INTERVAL 8 SECOND, "
+                "INTERVAL 5 SECOND)"))
+        # 同一 HOP 仍可恢复
+        q2 = self.make_query(sql=HOP_SQL_SUMS)
+        q2.advance_watermark(10_000)
+        self.assertEqual([r["total"] for r in q2.drain()], [1])
+
+    def test_tumble_state_cannot_be_opened_as_hop(self):
+        q = self.make_query()
+        q.push({"user_id": "u1", "event_time": 0, "amount": 1, "record_id": "r1"})
+        with self.assertRaises(StateStorageError):
+            self.make_query(sql=(
+                "SELECT user_id, SUM(amount) AS total FROM orders "
+                "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, "
+                "INTERVAL 10 SECOND)"))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,21 @@ SQL_FULL = """
     GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 """
 
+HOP_SQL = """
+    SELECT user_id,
+           HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_start,
+           HOP_END(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) AS window_end,
+           SUM(amount) AS total
+    FROM orders
+    GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)
+"""
+
+HOP_SQL_SUMS = """
+    SELECT user_id, SUM(amount) AS total
+    FROM orders
+    GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)
+"""
+
 
 def make_query(sql=SQL_FULL):
     return compile_query(sql)
@@ -106,8 +121,35 @@ class CompileTest(unittest.TestCase):
             "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
             "SELECT user_id, TUMBLE_START(event_time, INTERVAL 5 SECOND) FROM orders "
             "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",  # 间隔不一致
+            "SELECT user_id, HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 4 SECOND) "
+            "FROM orders "  # HOP_START slide 与分组不一致
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)",
+            "SELECT user_id, HOP_END(event_time, INTERVAL 9 SECOND, INTERVAL 5 SECOND) "
+            "FROM orders "  # HOP_END size 与分组不一致
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)",
+            "SELECT user_id, TUMBLE_START(event_time, INTERVAL 10 SECOND) FROM orders "
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)",  # 混用
+            "SELECT user_id, HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) "
+            "FROM orders "  # HOP_START 配 TUMBLE 分组
+            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
+            "SELECT user_id, SUM(amount) FROM orders "  # slide 大于 size
+            "GROUP BY user_id, HOP(event_time, INTERVAL 5 SECOND, INTERVAL 10 SECOND)",
+            "SELECT user_id, SUM(amount) FROM orders "  # HOP size 为零
+            "GROUP BY user_id, HOP(event_time, INTERVAL 0 SECOND, INTERVAL 0 SECOND)",
+            "SELECT user_id, SUM(amount) FROM orders "  # HOP slide 为零
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 0 SECOND)",
+            "SELECT user_id, SUM(amount) FROM orders "  # HOP slide 非正（负号无法词法）
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 'x' SECOND)",
+            "SELECT user_id, HOP_START(event_time, INTERVAL 10 SECOND) FROM orders "  # 缺 slide 参数
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)",
+            "SELECT user_id, HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND, "
+            "INTERVAL 2 SECOND) FROM orders "  # HOP_START 参数过多
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)",
+            "SELECT user_id, SUM(amount) FROM orders "  # 不支持的表达式
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 MINUTE, INTERVAL 5 SECOND)",
             "SELECT user_id, SUM(amount) FROM orders "  # 多余子句
-            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND) HAVING SUM(amount) > 1",
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND) "
+            "HAVING SUM(amount) > 1",
         ]
         for sql in bad_sql:
             with self.assertRaises(QuerySyntaxError, msg=sql):
@@ -342,6 +384,182 @@ class ErrorHandlingTest(unittest.TestCase):
         self.assertEqual([r["total"] for r in rows], [5])
         q.advance_watermark(20_000)
         self.assertEqual([r["total"] for r in q.drain()], [7])
+
+
+class HopCompileTest(unittest.TestCase):
+    def test_hop_query_compiles(self):
+        q = compile_query(HOP_SQL)
+        self.assertEqual(q.columns, ("user_id", "window_start", "window_end", "total"))
+        self.assertEqual(q.window_type, "hop")
+        self.assertEqual(q.size_ms, 10_000)
+        self.assertEqual(q.slide_ms, 5_000)
+
+    def test_hop_default_column_names(self):
+        q = compile_query(
+            "SELECT user_id, "
+            "HOP_START(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND), "
+            "HOP_END(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND), SUM(amount) "
+            "FROM orders GROUP BY user_id, "
+            "HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)")
+        self.assertEqual(q.columns,
+                         ("user_id", "window_start", "window_end", "sum_amount"))
+
+    def test_hop_case_insensitive_and_quoted_interval_and_reversed_group_by(self):
+        q = compile_query(
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY hop(EVENT_TIME, interval '10' second, INTERVAL 5 SECOND), user_id")
+        self.assertEqual(q.window_type, "hop")
+        self.assertEqual((q.size_ms, q.slide_ms), (10_000, 5_000))
+
+    def test_slide_equals_size_is_tumble_equivalent(self):
+        hop = compile_query(
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 10 SECOND)")
+        tumble = compile_query(
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)")
+        for q in (hop, tumble):
+            q.push({"user_id": "u1", "event_time": 1_000, "amount": 2})
+            q.push({"user_id": "u1", "event_time": 9_000, "amount": 3})
+            q.advance_watermark(10_000)
+        self.assertEqual(hop.drain(), tumble.drain())
+
+
+class HopExecutionTest(unittest.TestCase):
+    def test_record_fans_into_multiple_windows(self):
+        q = compile_query(HOP_SQL_SUMS)
+        # t=7000 落入窗口 [0,10) 与 [5,15)
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 7_000, "amount": 4}),
+                         "included")
+        self.assertEqual(sorted(q._state), [(0, "u1"), (5_000, "u1")])
+        q.advance_watermark(10_000)
+        self.assertEqual(q.drain(), [
+            {"user_id": "u1", "total": 4},
+        ])
+        # [5,15) 尚未确定
+        self.assertEqual(q.drain(), [])
+        q.advance_watermark(15_000)
+        self.assertEqual(q.drain(), [{"user_id": "u1", "total": 4}])
+
+    def test_windows_are_slide_aligned_left_closed_right_open(self):
+        q = compile_query(HOP_SQL_SUMS)
+        # t=5000 恰为边界：落入 [5,15) 但不落入 [0,10) 之前的 [0,10)? 落入
+        # [0,10)（0 <= 5000）与 [5,15)；不再落入 [-5,5)（右开，5000 排除）
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 5_000, "amount": 1}),
+                         "included")
+        self.assertEqual(sorted(q._state), [(0, "u1"), (5_000, "u1")])
+
+    def test_aggregation_across_overlapping_windows(self):
+        q = compile_query(
+            "SELECT user_id, HOP_START(event_time, INTERVAL 10 SECOND, "
+            "INTERVAL 5 SECOND) AS window_start, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 5 SECOND)")
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 2})  # [-5,5),[0,10)
+        q.push({"user_id": "u1", "event_time": 6_000, "amount": 3})  # [0,10),[5,15)
+        q.advance_watermark(15_000)
+        rows = q.drain()
+        totals = {r["window_start"]: r["total"] for r in rows}
+        self.assertEqual(totals, {
+            "1969-12-31T23:59:55Z": 2,
+            "1970-01-01T00:00:00Z": 5,
+            "1970-01-01T00:00:05Z": 3,
+        })
+
+    def test_output_ordering_by_start_end_user(self):
+        q = compile_query(HOP_SQL)
+        q.push({"user_id": "u2", "event_time": 1_000, "amount": 1})
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 2})
+        q.advance_watermark(5_000)
+        rows = q.drain()
+        self.assertEqual(
+            [(r["window_start"], r["user_id"]) for r in rows],
+            [("1969-12-31T23:59:55Z", "u1"),
+             ("1969-12-31T23:59:55Z", "u2")])
+
+    def test_window_determines_when_watermark_reaches_end(self):
+        q = compile_query(HOP_SQL_SUMS)
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 1})
+        q.advance_watermark(4_999)
+        self.assertEqual(q.drain(), [])  # [-5,5) 结束于 5000
+        q.advance_watermark(5_000)
+        self.assertEqual([k[0] for k, _ in q._state.items()], [-5_000, 0])
+        self.assertEqual(len(q.drain()), 1)
+
+    def test_late_records_not_added_to_any_window(self):
+        q = compile_query(HOP_SQL_SUMS)
+        q.push({"user_id": "u1", "event_time": 1_000, "amount": 5})  # -5:5, 0:5
+        q.push({"user_id": "u1", "event_time": 6_000, "amount": 7})  # 0:12, 5:7
+        q.advance_watermark(10_000)
+        # t=9000 本应进入 [0,10) 与 [5,15)，但早于水位 -> late，两窗都不变
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 9_000, "amount": 100}),
+                         "late")
+        rows = q.drain()  # 确定 -5 与 0
+        self.assertEqual([r["total"] for r in rows], [5, 12])
+        q.advance_watermark(15_000)
+        rows = q.drain()  # [5,15) 不包含迟到的 100
+        self.assertEqual([r["total"] for r in rows], [7])
+
+    def test_non_divisible_slide(self):
+        # slide 不整除 size 也按同一成员条件落窗
+        q = compile_query(
+            "SELECT user_id, SUM(amount) AS total FROM orders "
+            "GROUP BY user_id, HOP(event_time, INTERVAL 10 SECOND, INTERVAL 4 SECOND)")
+        # t=7000：4k 对齐起点 …,0,4；[0,10) 与 [4,14) 都包含 7000
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1})
+        self.assertEqual(sorted(k[0] for k in q._state), [0, 4_000])
+
+
+class HopBackpressureTest(unittest.TestCase):
+    def test_all_new_keys_must_fit(self):
+        q = compile_query(HOP_SQL_SUMS, capacity=2)
+        # 一条记录扇出 2 个新键，恰好占满
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 7_000, "amount": 1}),
+                         "included")
+        # 另一用户同样扇出 2 个新键，无法全部容纳 -> 整条背压
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 7_000, "amount": 1}),
+                         "backpressured")
+        self.assertEqual(sorted(q._state), [(0, "u1"), (5_000, "u1")])
+
+    def test_no_partial_accumulation(self):
+        q = compile_query(HOP_SQL_SUMS, capacity=2)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1})  # 占 0,5
+        blocked = {"user_id": "u1", "event_time": 12_000, "amount": 9}
+        # t=12000 扇出 [5,15)（已存在）与 [10,20)（新键），放不下
+        self.assertEqual(q.push(blocked), "backpressured")
+        # 已存在的 [5,15) 不允许部分累加
+        self.assertEqual(q._state[(5_000, "u1")], 1)
+        self.assertNotIn((10_000, "u1"), q._state)
+
+    def test_existing_keys_still_accepted_when_full(self):
+        q = compile_query(HOP_SQL_SUMS, capacity=2)
+        q.push({"user_id": "u1", "event_time": 7_000, "amount": 1})  # 占 0,5
+        # t=3000 扇出 [0,10)（存在）与 [-5,5)（新）-> 背压
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 3_000, "amount": 1}),
+                         "backpressured")
+        # t=7000 的两个目标键都已存在 -> 容量满也 included
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 7_000, "amount": 4}),
+                         "included")
+        self.assertEqual(q._state[(0, "u1")], 5)
+        self.assertEqual(q._state[(5_000, "u1")], 5)
+
+    def test_drain_frees_capacity_per_window_user_pair(self):
+        # HOP size=10 slide=5，capacity=2：t=7000 扇出 [0,10)、[5,15) 两键占满
+        q = compile_query(HOP_SQL_SUMS, capacity=2)
+        self.assertEqual(q.push({"user_id": "u1", "event_time": 7_000, "amount": 1}),
+                         "included")
+        # 新用户同位置需 2 个新键 -> 共 4 > 2，背压
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 7_000, "amount": 1}),
+                         "backpressured")
+        q.advance_watermark(10_000)
+        self.assertEqual(len(q.drain()), 1)  # 仅 [0,10) 确定，[5,15) 仍占名额
+        # 水位之后的事件扇出 [5,15)、[10,20) 两个新键：1 + 2 > 2 仍背压
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 12_000, "amount": 1}),
+                         "backpressured")
+        q.advance_watermark(15_000)
+        self.assertEqual(len(q.drain()), 1)  # [5,15) 确定并释放
+        # 容量已全部释放，新事件扇出 2 个新键可被接收
+        self.assertEqual(q.push({"user_id": "u2", "event_time": 17_000, "amount": 2}),
+                         "included")
 
 
 if __name__ == "__main__":
