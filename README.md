@@ -8,7 +8,7 @@
 
 ## 状态
 
-已实现：由乱序水位推进的事件时间翻滚窗口 SQL 聚合、有界背压控制与
+已实现：由乱序水位推进的事件时间翻滚/滑动/会话窗口 SQL 聚合、有界背压控制与
 Exactly-once 状态（持久化、重启恢复、记录去重）
 （`stream_sql.py`，仅标准库，无外部依赖）。
 
@@ -45,6 +45,32 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 - 窗口间隔必须是正的秒数；`TUMBLE_START`/`TUMBLE_END` 的间隔须与 `TUMBLE` 一致。
 - 窗口左闭右开，按 epoch 对齐。
 
+滑动窗口 `HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND)` 与
+`HOP_START`/`HOP_END` 同理：size 与 slide 均为正整数秒且 slide 不大于 size，
+一条记录落入所有覆盖其事件时间的窗口。
+
+会话窗口形态：
+
+```sql
+SELECT user_id,
+       SESSION_START(event_time, INTERVAL 30 SECOND),
+       SESSION_END(event_time, INTERVAL 30 SECOND),
+       SUM(amount)
+FROM orders
+GROUP BY user_id, SESSION(event_time, INTERVAL 30 SECOND)
+```
+
+- gap 必须是正的秒数（整数或对应字符串）；`SESSION_START`/`SESSION_END` 的
+  间隔须与 `SESSION` 一致；缺省列名为 `session_start`、`session_end`、`sum_amount`。
+- 同一 `user_id` 内相邻事件时间差不超过 gap 的记录归入同一会话；一条记录可
+  同时连接前后两个会话并将其合并，`amount` 只累加一次。
+- `session_start` 为会话内最小事件时间，`session_end` 为最大事件时间加 gap，
+  不做 epoch 对齐。
+- 水位严格大于 `session_end` 后会话确定，由下一次 `drain()` 按
+  (`session_start`, `session_end`, `user_id`) 排序输出并移除。
+- SESSION 与 TUMBLE、HOP 不可混用；窗口参数不符或混用时 `compile_query`
+  抛出 `QuerySyntaxError`。
+
 ### 记录与水位
 
 - `push(record)` 接收字段名到值的映射，必须含 `user_id`（str 或 int）、
@@ -63,7 +89,8 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 
 - `compile_query(sql, capacity=...)` 的 `capacity` 省略或为 `None` 时查询无界；
   给定正整数时表示查询可保留的最大未输出聚合键数
-  （聚合键由窗口起点与 `user_id` 确定）。
+  （聚合键由窗口起点与 `user_id` 确定；SESSION 窗口的聚合键为合并后的
+  （`user_id`, 会话））。
 - `capacity` 只接受大于零的整数；`bool`、零、负数和其他类型都抛出
   `QueryConfigurationError`，且不创建查询实例。
 - 合法记录属于已存在的聚合键时，即使容量已满也返回 `"included"` 并累加；
