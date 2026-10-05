@@ -84,7 +84,13 @@ class CompileTest(unittest.TestCase):
             "SELECT user_id FROM orders",  # 缺 GROUP BY
             "SELECT user_id, event_time FROM orders "  # 不支持的 select 表达式
             "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
-            "SELECT user_id, COUNT(amount) FROM orders "  # 不支持的聚合
+            "SELECT user_id, AVG(amount) FROM orders "  # 不支持的聚合
+            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
+            "SELECT user_id, COUNT(user_id) FROM orders "  # 聚合作用于 amount 之外
+            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
+            "SELECT user_id, MIN(event_time) FROM orders "
+            "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
+            "SELECT user_id, MAX(*) FROM orders "
             "GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)",
             "SELECT user_id, SUM(amount) FROM orders "  # 限定字段之外的字段
             "GROUP BY user_id, TUMBLE(ts, INTERVAL 10 SECOND)",

@@ -380,9 +380,11 @@ class SessionStateTest(unittest.TestCase):
         q = self.make_query()
         q.push({"user_id": "u1", "event_time": 1_000, "amount": 3, "record_id": "r1"})
         doc = self.read_state_file()
+        doc = self.read_state_file()
+        self.assertEqual(doc["version"], 2)
         self.assertEqual(doc["fingerprint"]["session"], {"gap_ms": GAP})
         self.assertNotIn("windows", doc)
-        self.assertEqual(doc["sessions"], [["u1", 1_000, 1_000, 3]])
+        self.assertEqual(doc["sessions"], [["u1", 1_000, 1_000, 3, 1, 3, 3]])
         self.assertEqual(doc["seen_ids"], ["r1"])
 
     def test_fingerprint_distinguishes_window_kind_and_gap(self):
