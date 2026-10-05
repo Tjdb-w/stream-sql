@@ -382,7 +382,7 @@ class SessionStateTest(unittest.TestCase):
         doc = self.read_state_file()
         self.assertEqual(doc["fingerprint"]["session"], {"gap_ms": GAP})
         self.assertNotIn("windows", doc)
-        self.assertEqual(doc["sessions"], [["u1", 1_000, 1_000, 3]])
+        self.assertEqual(doc["sessions"], [["u1", 1_000, 1_000, 3, 1, 3, 3]])
         self.assertEqual(doc["seen_ids"], ["r1"])
 
     def test_fingerprint_distinguishes_window_kind_and_gap(self):

@@ -125,7 +125,8 @@ _TOKEN_RE = re.compile(
 _KEYWORDS = frozenset({
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "AS",
     "AND", "OR", "NOT", "TUMBLE", "TUMBLE_START", "TUMBLE_END",
-    "HOP", "HOP_START", "HOP_END", "SUM",
+    "HOP", "HOP_START", "HOP_END",
+    "SUM", "COUNT", "MIN", "MAX",
     "SESSION", "SESSION_START", "SESSION_END",
     "INTERVAL", "SECOND", "ORDERS",
 })
@@ -164,12 +165,18 @@ def _tokenize(sql):
 #                | HOP_END   '(' event_time ',' interval ',' interval ')'
 #                | SESSION_START '(' event_time ',' interval ')'
 #                | SESSION_END   '(' event_time ',' interval ')'
-#                | SUM '(' amount ')' ) [ [AS] alias ]
+#                | agg '(' amount ')' ) [ [AS] alias ]
+# agg         := SUM | COUNT | MIN | MAX
 # group_list  := user_id ',' window_fn （两项顺序可互换）
 # window_fn   := TUMBLE '(' event_time ',' interval ')'
 #              | HOP '(' event_time ',' interval ',' interval ')'
 #              | SESSION '(' event_time ',' interval ')'
 # interval    := INTERVAL ( number | 'number' ) SECOND
+#
+# 聚合列可任意排列、省略或使用 AS 别名；同一聚合可按不同别名重复输出。
+# 缺省列名依次为 sum_amount、count_amount、min_amount、max_amount。
+# 四类聚合（SUM/COUNT/MIN/MAX）对每条记录共同原子更新，与是否出现在
+# SELECT 列表无关；SELECT 只决定输出哪些列。
 # ---------------------------------------------------------------------------
 
 def _validate_hop_params(size_ms, slide_ms):
@@ -242,12 +249,17 @@ class _Parser:
 
         seen_names = set()
         columns = []
-        for _, col_kind, _, alias in select_items:
-            name = alias if alias is not None else col_kind
+        for tag, col_kind, param, alias in select_items:
+            if tag == "agg":
+                kind = param  # sum / count / min / max
+                default_name = col_kind  # sum_amount / count_amount / ...
+            else:
+                kind = default_name = col_kind
+            name = alias if alias is not None else default_name
             if name in seen_names:
                 raise QuerySyntaxError("duplicate output column name: %r" % name)
             seen_names.add(name)
-            columns.append((col_kind, name))
+            columns.append((kind, name))
         if not any(kind == "user_id" for kind, _ in columns):
             raise QuerySyntaxError("SELECT list must include user_id")
         return columns, window
@@ -266,11 +278,14 @@ class _Parser:
         upper = text.upper()
         if upper == "USER_ID":
             item = ("user_id", "user_id", None)
-        elif upper == "SUM":
+        elif upper in ("SUM", "COUNT", "MIN", "MAX"):
             self._expect_punct("(")
-            self._expect_field("amount")
+            kind2, field = self._next()
+            if kind2 != "ident" or field.lower() != "amount":
+                raise QuerySyntaxError(
+                    "%s is only supported on field 'amount', got %r" % (upper, field))
             self._expect_punct(")")
-            item = ("sum", "sum_amount", None)
+            item = ("agg", upper.lower() + "_amount", upper.lower())
         elif upper in ("TUMBLE_START", "TUMBLE_END"):
             self._expect_punct("(")
             self._expect_field("event_time")
@@ -403,13 +418,36 @@ def _user_id_sort_key(user_id):
     return (1, 0, user_id)
 
 
+def _new_accumulator(amount):
+    """新聚合键的四类聚合初值 [sum, count, min, max]。"""
+    return [amount, 1, amount, amount]
+
+
+# SELECT 聚合列类型到四元组下标的映射。
+_AGG_INDEX = {"sum": 0, "count": 1, "min": 2, "max": 3}
+
+
+def _update_accumulator(acc, amount):
+    """把一条记录的 amount 共同原子地并入四类聚合。"""
+    acc[0] += amount
+    acc[1] += 1
+    if amount < acc[2]:
+        acc[2] = amount
+    if amount > acc[3]:
+        acc[3] = amount
+
+
 # ---------------------------------------------------------------------------
 # Exactly-once 状态持久化
 #
 # 状态文件为单个 JSON 文档，包含格式版本、查询指纹（输出列、窗口函数
-# 及其参数、capacity）、当前水位、未输出窗口聚合与已处理 record_id 集合。每次成功
-# 变更通过 临时文件 + os.replace 原子提交完整状态；提交失败时内存状态
-# 回滚到变更前，已提交状态保持不变。
+# 及其参数、capacity）、当前水位、未输出窗口的四类聚合（SUM/COUNT/MIN/MAX）
+# 与已处理 record_id 集合。每次成功变更通过 临时文件 + os.replace 原子提交
+# 完整状态；提交失败时内存状态回滚到变更前，已提交状态保持不变。
+#
+# windows 条目布局为 [window_start, user_id, sum, count, min, max]；
+# sessions 条目布局为 [user_id, start, max_event, sum, count, min, max]。
+# 旧版仅 SUM 的 3/4 元素条目仍可读取（count 视为 1，min/max 取 sum 值）。
 # ---------------------------------------------------------------------------
 
 _STATE_VERSION = 1
@@ -421,6 +459,21 @@ def _validate_state_user_id(value, path):
     return value
 
 
+def _parse_state_acc(values, path):
+    """校验状态中的四类聚合 [sum, count, min, max]。"""
+    if len(values) != 4:
+        raise StateStorageError("state file %r is corrupted: bad aggregate" % path)
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise StateStorageError(
+                "state file %r is corrupted: bad aggregate" % path)
+    total, count, minimum, maximum = values
+    if count <= 0 or minimum > maximum:
+        raise StateStorageError(
+            "state file %r is corrupted: bad aggregate" % path)
+    return [total, count, minimum, maximum]
+
+
 class StreamQuery:
     """由 compile_query 编译得到的可执行流式查询。"""
 
@@ -429,8 +482,10 @@ class StreamQuery:
         self._window_kind, self._size_ms, self._slide_ms = window
         self._capacity = capacity  # None 表示无界
         self._watermark_ms = None
-        self._state = {}  # (window_start_ms, user_id) -> sum(amount)
-        # SESSION 窗口：user_id -> [[session_start_ms, max_event_ms, total], ...]
+        # (window_start_ms, user_id) -> [sum, count, min, max](amount)
+        self._state = {}
+        # SESSION 窗口：user_id -> [[session_start_ms, max_event_ms,
+        #                          sum, count, min, max], ...]
         # 每个用户的会话按 session_start 升序，且两两间隔大于 gap（否则已合并）。
         self._sessions = {}
         self._state_path = state_path  # None 表示纯内存模式
@@ -516,22 +571,24 @@ class StreamQuery:
         # 不部分累加、不登记 record_id。
         if self._capacity is not None and len(self._state) + len(created) > self._capacity:
             return "backpressured"
+        # MIN/MAX 的并入不可逆，提交失败时用并入前快照整体回滚。
+        previous = {key: list(self._state[key]) for key in keys if key not in created}
+        created_set = set(created)
         for key in created:
-            self._state[key] = 0
+            self._state[key] = _new_accumulator(amount)
         for key in keys:
-            self._state[key] += amount
+            if key not in created_set:
+                _update_accumulator(self._state[key], amount)
         if persistent:
             self._seen_ids.add(record_id)
             try:
                 self._commit()
             except StateStorageError:
                 self._seen_ids.discard(record_id)
-                created_set = set(created)
-                for key in keys:
-                    if key in created_set:
-                        del self._state[key]
-                    else:
-                        self._state[key] -= amount
+                for key in created:
+                    del self._state[key]
+                for key, acc in previous.items():
+                    self._state[key] = acc
                 raise
         return "included"
 
@@ -548,8 +605,9 @@ class StreamQuery:
     def _push_session(self, user_id, event_ms, amount, persistent, record_id):
         """SESSION 窗口摄入：把事件并入时间差不超过 gap 的相邻会话。
 
-        一条记录可能同时连接前后两个会话，此时合并为一个会话；amount
-        只累加一次。容量按合并后的会话总数判断：合并后不超容量才接收，
+        一条记录可能同时连接前后两个会话，此时合并为一个会话；该记录的
+        四类聚合只贡献一次（SUM 加一份、COUNT 加一、MIN/MAX 并入一次）。
+        容量按合并后的会话总数判断：合并后不超容量才接收，
         否则整体背压，不修改任何会话状态。
         """
         gap = self._size_ms
@@ -557,7 +615,7 @@ class StreamQuery:
         sessions = self._sessions.get(user_id, [])
         previous = [list(entry) for entry in sessions]  # 提交失败时回滚用
         lo = hi = None
-        for idx, (start, max_event, _total) in enumerate(sessions):
+        for idx, (start, max_event, _sum, _count, _min, _max) in enumerate(sessions):
             if start - gap <= event_ms <= max_event + gap:
                 if lo is None:
                     lo = idx
@@ -571,12 +629,17 @@ class StreamQuery:
             pos = 0
             while pos < len(sessions) and sessions[pos][0] < event_ms:
                 pos += 1
-            sessions.insert(pos, [event_ms, event_ms, amount])
+            sessions.insert(pos, [event_ms, event_ms, amount, 1, amount, amount])
         else:
+            # 记录只贡献一次：SUM/COUNT 加一份，MIN/MAX 并入一次。
+            merged_entries = sessions[lo:hi + 1]
             new_entry = [
                 min(event_ms, sessions[lo][0]),
                 max(event_ms, sessions[hi][1]),
-                amount + sum(entry[2] for entry in sessions[lo:hi + 1]),
+                amount + sum(entry[2] for entry in merged_entries),
+                1 + sum(entry[3] for entry in merged_entries),
+                min([amount] + [entry[4] for entry in merged_entries]),
+                max([amount] + [entry[5] for entry in merged_entries]),
             ]
             sessions[lo:hi + 1] = [new_entry]
         if not had_user:
@@ -627,15 +690,15 @@ class StreamQuery:
         rows = []
         removed = []
         for window_start, user_id in ready:
-            total = self._state.pop((window_start, user_id))
-            removed.append(((window_start, user_id), total))
-            rows.append(self._build_row(window_start, user_id, total))
+            acc = self._state.pop((window_start, user_id))
+            removed.append(((window_start, user_id), acc))
+            rows.append(self._build_row(window_start, user_id, acc))
         if self._state_path is not None and removed:
             try:
                 self._commit()
             except StateStorageError:
-                for key, total in removed:
-                    self._state[key] = total
+                for key, acc in removed:
+                    self._state[key] = acc
                 raise
         return rows
 
@@ -643,11 +706,12 @@ class StreamQuery:
         """输出水位严格大于 session_end 的已确定会话，按
         (session_start, session_end, user_id) 排序，随后从状态中移除。"""
         gap = self._size_ms
-        ready = []  # (session_start, session_end, user_id, total)
+        ready = []  # (session_start, session_end, user_id, accumulator)
         for user_id, sessions in self._sessions.items():
-            for start, max_event, total in sessions:
+            for entry in sessions:
+                start, max_event = entry[0], entry[1]
                 if max_event + gap < self._watermark_ms:
-                    ready.append((start, max_event + gap, user_id, total))
+                    ready.append((start, max_event + gap, user_id, entry[2:]))
         if not ready:
             return []
         ready.sort(key=lambda item: (item[0], item[1], _user_id_sort_key(item[2])))
@@ -656,7 +720,7 @@ class StreamQuery:
             for uid, entries in self._sessions.items()
         }
         rows = []
-        for start, end, user_id, total in ready:
+        for start, end, user_id, acc in ready:
             entries = self._sessions[user_id]
             for idx, entry in enumerate(entries):
                 if entry[0] == start:
@@ -664,7 +728,7 @@ class StreamQuery:
                     break
             if not entries:
                 del self._sessions[user_id]
-            rows.append(self._build_session_row(start, end, user_id, total))
+            rows.append(self._build_session_row(start, end, user_id, acc))
         if self._state_path is not None:
             try:
                 self._commit()
@@ -673,7 +737,7 @@ class StreamQuery:
                 raise
         return rows
 
-    def _build_session_row(self, session_start, session_end, user_id, total):
+    def _build_session_row(self, session_start, session_end, user_id, acc):
         row = {}
         for kind, name in self._columns:
             if kind == "user_id":
@@ -682,11 +746,11 @@ class StreamQuery:
                 row[name] = _format_iso8601(session_start)
             elif kind == "session_end":
                 row[name] = _format_iso8601(session_end)
-            else:  # sum_amount
-                row[name] = total
+            else:  # 聚合列 sum/count/min/max
+                row[name] = acc[_AGG_INDEX[kind]]
         return row
 
-    def _build_row(self, window_start, user_id, total):
+    def _build_row(self, window_start, user_id, acc):
         row = {}
         for kind, name in self._columns:
             if kind == "user_id":
@@ -695,8 +759,8 @@ class StreamQuery:
                 row[name] = _format_iso8601(window_start)
             elif kind == "window_end":
                 row[name] = _format_iso8601(window_start + self._size_ms)
-            else:  # sum_amount
-                row[name] = total
+            else:  # 聚合列 sum/count/min/max
+                row[name] = acc[_AGG_INDEX[kind]]
         return row
 
     # ------------------------------------------------------------------
@@ -735,17 +799,17 @@ class StreamQuery:
         }
         if self._window_kind == "session":
             doc["sessions"] = [
-                [user_id, session_start, max_event, total]
+                [user_id, entry[0], entry[1], entry[2], entry[3], entry[4], entry[5]]
                 for user_id, sessions in sorted(
                     self._sessions.items(),
                     key=lambda item: _user_id_sort_key(item[0]),
                 )
-                for session_start, max_event, total in sessions
+                for entry in sessions
             ]
         else:
             doc["windows"] = [
-                [window_start, user_id, total]
-                for (window_start, user_id), total in sorted(
+                [window_start, user_id, acc[0], acc[1], acc[2], acc[3]]
+                for (window_start, user_id), acc in sorted(
                     self._state.items(),
                     key=lambda item: (item[0][0], _user_id_sort_key(item[0][1])),
                 )
@@ -830,19 +894,27 @@ class StreamQuery:
             raise StateStorageError("state file %r is corrupted: bad windows" % path)
         state = {}
         for entry in windows:
-            if not isinstance(entry, list) or len(entry) != 3:
+            if not isinstance(entry, list) or len(entry) not in (3, 6):
                 raise StateStorageError("state file %r is corrupted: bad window" % path)
-            window_start, user_id, total = entry
+            window_start, user_id = entry[0], entry[1]
             if isinstance(window_start, bool) or not isinstance(window_start, int):
                 raise StateStorageError("state file %r is corrupted: bad window" % path)
             _validate_state_user_id(user_id, path)
-            if isinstance(total, bool) or not isinstance(total, int):
-                raise StateStorageError("state file %r is corrupted: bad window" % path)
+            if len(entry) == 3:
+                # 旧版仅 SUM 布局：[start, user_id, sum]，count 视为 1，
+                # min/max 无历史信息，取该窗口的唯一可用值 sum。
+                total = entry[2]
+                if isinstance(total, bool) or not isinstance(total, int):
+                    raise StateStorageError(
+                        "state file %r is corrupted: bad window" % path)
+                acc = [total, 1, total, total]
+            else:
+                acc = _parse_state_acc(entry[2:], path)
             key = (window_start, user_id)
             if key in state:
                 raise StateStorageError(
                     "state file %r is corrupted: duplicate window" % path)
-            state[key] = total
+            state[key] = acc
         return state
 
     def _parse_state_sessions(self, sessions_doc, path):
@@ -850,18 +922,28 @@ class StreamQuery:
             raise StateStorageError("state file %r is corrupted: bad sessions" % path)
         sessions = {}
         for entry in sessions_doc:
-            if not isinstance(entry, list) or len(entry) != 4:
+            if not isinstance(entry, list) or len(entry) not in (4, 7):
                 raise StateStorageError("state file %r is corrupted: bad session" % path)
-            user_id, session_start, max_event, total = entry
+            user_id, session_start, max_event = entry[0], entry[1], entry[2]
             _validate_state_user_id(user_id, path)
-            for value in (session_start, max_event, total):
+            for value in (session_start, max_event):
                 if isinstance(value, bool) or not isinstance(value, int):
                     raise StateStorageError(
                         "state file %r is corrupted: bad session" % path)
             if session_start > max_event:
                 raise StateStorageError(
                     "state file %r is corrupted: bad session" % path)
-            sessions.setdefault(user_id, []).append([session_start, max_event, total])
+            if len(entry) == 4:
+                # 旧版仅 SUM 布局：[user_id, start, max_event, sum]。
+                total = entry[3]
+                if isinstance(total, bool) or not isinstance(total, int):
+                    raise StateStorageError(
+                        "state file %r is corrupted: bad session" % path)
+                acc = [total, 1, total, total]
+            else:
+                acc = _parse_state_acc(entry[3:], path)
+            sessions.setdefault(user_id, []).append(
+                [session_start, max_event] + acc)
         gap = self._size_ms
         for user_sessions in sessions.values():
             user_sessions.sort(key=lambda item: item[0])
@@ -898,40 +980,51 @@ def compile_query(sql, capacity=None, state_path=None):
         SELECT user_id,
                [TUMBLE_START(event_time, INTERVAL n SECOND) [AS alias],]
                [TUMBLE_END(event_time, INTERVAL n SECOND) [AS alias],]
-               [SUM(amount) [AS alias]]
+               agg(amount) [AS alias] ...
         FROM orders
         GROUP BY user_id, TUMBLE(event_time, INTERVAL n SECOND)
+
+    其中 agg 为 SUM、COUNT、MIN、MAX 中的任意个，可任意排列、省略或
+    使用 AS 别名，同一聚合也可按不同别名重复输出；缺省列名依次为
+    sum_amount、count_amount、min_amount、max_amount。四类聚合无论是否
+    出现在 SELECT 中都随每条记录共同原子更新，SELECT 只决定输出哪些列。
 
     或滑动窗口形态：
 
         SELECT user_id,
                [HOP_START(event_time, INTERVAL n SECOND, INTERVAL m SECOND) [AS alias],]
                [HOP_END(event_time, INTERVAL n SECOND, INTERVAL m SECOND) [AS alias],]
-               [SUM(amount) [AS alias]]
+               agg(amount) [AS alias] ...
         FROM orders
         GROUP BY user_id, HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND)
 
     HOP 的 size（n）与 slide（m）均为正整数秒且 slide 不大于 size；
     一条记录落入所有起点为 slide 整数倍、且覆盖其事件时间的窗口，
-    分别累加到各 (window_start, user_id) 聚合键。TUMBLE 与 HOP 不可
-    混用，HOP_START/HOP_END 的参数必须与 GROUP BY 的 HOP 一致。
+    四类聚合分别参与每个覆盖窗口，分别累加到各
+    (window_start, user_id) 聚合键。TUMBLE 与 HOP 不可混用，
+    HOP_START/HOP_END 的参数必须与 GROUP BY 的 HOP 一致。
 
     会话窗口形态：
 
         SELECT user_id,
                [SESSION_START(event_time, INTERVAL n SECOND) [AS alias],]
                [SESSION_END(event_time, INTERVAL n SECOND) [AS alias],]
-               [SUM(amount) [AS alias]]
+               agg(amount) [AS alias] ...
         FROM orders
         GROUP BY user_id, SESSION(event_time, INTERVAL n SECOND)
 
     SESSION 的 gap（n）为正整数秒；同一 user_id 内相邻事件时间差不超过
     gap 的记录归入同一会话，一条记录可连接前后两个会话并将其合并，
-    amount 只累加一次。session_start 为会话内最小事件时间，session_end
+    四类聚合在合并时每条记录只贡献一次（SUM 加一份、COUNT 加一、
+    MIN/MAX 并入一次）。session_start 为会话内最小事件时间，session_end
     为最大事件时间加 gap（不做 epoch 对齐）；水位严格大于 session_end
     后会话确定，drain 按 (session_start, session_end, user_id) 排序输出。
     SESSION 与 TUMBLE、HOP 不可混用，SESSION_START/SESSION_END 的
     间隔必须与 GROUP BY 的 SESSION 一致。
+
+    聚合语义：SUM 累加 amount，COUNT 统计 amount 的条数，MIN/MAX 取
+    最小、最大整数；未知聚合或聚合作用于 amount 之外的字段抛
+    QuerySyntaxError。
 
     capacity 省略或为 None 时查询无界；给定正整数时表示查询可保留的
     最大未输出聚合键数（聚合键由窗口起点与 user_id 确定；SESSION 窗口
@@ -943,7 +1036,10 @@ def compile_query(sql, capacity=None, state_path=None):
     state_path 省略或为 None 时查询为纯内存模式，行为与既往一致。
     给定 state_path 时查询进入持久模式：每次成功变更把完整状态原子
     提交到该文件，使用同一 SQL、capacity 和 state_path 重新构造查询
-    即可恢复未输出窗口、当前水位与去重信息。持久模式下每条记录必须
+    即可恢复未输出窗口的四类聚合（SUM/COUNT/MIN/MAX）、当前水位与
+    去重信息。旧版仅 SUM 的状态文件仍可恢复（COUNT 视为 1，MIN/MAX
+    取该窗口唯一可用值），随后继续共同维护四类聚合；新查询读取列集合
+    不匹配的状态时抛 StateStorageError。持久模式下每条记录必须
     带非空字符串 record_id，已处理过的 record_id 返回 "duplicate"。
     state_path 为空字符串、非字符串、不可写，或状态文件损坏、版本
     不兼容、与 SQL 或 capacity 不一致时抛出 StateStorageError。

@@ -34,20 +34,26 @@ rows = query.drain()                # -> list[dict]，已确定结果
 SELECT user_id,
        TUMBLE_START(event_time, INTERVAL 10 SECOND) AS window_start,
        TUMBLE_END(event_time, INTERVAL 10 SECOND) AS window_end,
-       SUM(amount) AS total
+       SUM(amount), COUNT(amount), MIN(amount), MAX(amount)
 FROM orders
 GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 ```
 
 - 数据源固定为 `orders`，可用字段限定为 `user_id`、`event_time`、`amount`。
-- `user_id` 必选；`TUMBLE_START`、`TUMBLE_END`、`SUM(amount)` 为可选别名列，
-  未给别名时输出列名依次为 `window_start`、`window_end`、`sum_amount`。
+- `user_id` 必选；`TUMBLE_START`、`TUMBLE_END` 为可选边界列，缺省列名
+  `window_start`、`window_end`。
+- 聚合支持 `SUM(amount)`、`COUNT(amount)`、`MIN(amount)`、`MAX(amount)`，
+  可任意排列、全部省略或使用 `AS` 别名；同一聚合可按不同别名重复输出。
+  缺省列名依次为 `sum_amount`、`count_amount`、`min_amount`、`max_amount`。
+  未知聚合、聚合作用于 `amount` 之外的字段抛 `QuerySyntaxError`。
+- 四类聚合无论是否出现在 SELECT 中都随每条记录共同原子维护，SELECT 只
+  决定输出哪些列：SUM 累加 amount、COUNT 统计条数、MIN/MAX 取最小最大整数。
 - 窗口间隔必须是正的秒数；`TUMBLE_START`/`TUMBLE_END` 的间隔须与 `TUMBLE` 一致。
 - 窗口左闭右开，按 epoch 对齐。
 
 滑动窗口 `HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND)` 与
 `HOP_START`/`HOP_END` 同理：size 与 slide 均为正整数秒且 slide 不大于 size，
-一条记录落入所有覆盖其事件时间的窗口。
+一条记录落入所有覆盖其事件时间的窗口，四类聚合分别参与每个覆盖窗口。
 
 会话窗口形态：
 
@@ -55,15 +61,17 @@ GROUP BY user_id, TUMBLE(event_time, INTERVAL 10 SECOND)
 SELECT user_id,
        SESSION_START(event_time, INTERVAL 30 SECOND),
        SESSION_END(event_time, INTERVAL 30 SECOND),
-       SUM(amount)
+       SUM(amount), COUNT(amount), MIN(amount), MAX(amount)
 FROM orders
 GROUP BY user_id, SESSION(event_time, INTERVAL 30 SECOND)
 ```
 
 - gap 必须是正的秒数（整数或对应字符串）；`SESSION_START`/`SESSION_END` 的
-  间隔须与 `SESSION` 一致；缺省列名为 `session_start`、`session_end`、`sum_amount`。
+  间隔须与 `SESSION` 一致；缺省列名为 `session_start`、`session_end` 及
+  四个 `*_amount` 聚合列。
 - 同一 `user_id` 内相邻事件时间差不超过 gap 的记录归入同一会话；一条记录可
-  同时连接前后两个会话并将其合并，`amount` 只累加一次。
+  同时连接前后两个会话并将其合并，四类聚合在合并时每条记录只贡献一次
+  （SUM 加一份、COUNT 加一、MIN/MAX 并入一次）。
 - `session_start` 为会话内最小事件时间，`session_end` 为最大事件时间加 gap，
   不做 epoch 对齐。
 - 水位严格大于 `session_end` 后会话确定，由下一次 `drain()` 按
@@ -82,7 +90,7 @@ GROUP BY user_id, SESSION(event_time, INTERVAL 30 SECOND)
 - 水位达到窗口结束时刻（`watermark >= window_end`）后该窗口结果确定，
   由下一次 `drain()` 输出并移除。
 - 每次 `drain()` 的结果按 `window_start`、`window_end`、`user_id` 排序；
-  每行只含查询声明的列；时间值输出 ISO 8601 UTC 字符串，`SUM(amount)` 输出整数。
+  每行只含查询声明的列；时间值输出 ISO 8601 UTC 字符串，四类聚合均输出整数。
 - 相同查询对相同记录顺序、水位顺序和 drain 时机给出相同结果。
 
 ### 背压控制
@@ -106,12 +114,16 @@ GROUP BY user_id, SESSION(event_time, INTERVAL 30 SECOND)
 - `compile_query(sql, capacity=..., state_path=...)` 给定 `state_path` 时进入持久模式；
   省略或为 `None` 时保持纯内存语义，返回值、异常与列输出完全不变。
 - 持久模式下每次 `push`、`advance_watermark`、`drain` 的成功变更都会把完整状态
-  （水位、未输出窗口聚合、已处理 `record_id`）原子提交到 `state_path` 指向的文件；
-  中途失败不留下部分更新，已提交状态保持不变。持久化只写该文件，
-  不额外创建日志或隐式目录。
+  （水位、未输出窗口的四类聚合 SUM/COUNT/MIN/MAX、已处理 `record_id`）原子提交
+  到 `state_path` 指向的文件；中途失败不留下部分更新，已提交状态保持不变。
+  持久化只写该文件，不额外创建日志或隐式目录。
 - 使用同一 SQL（语义等价即可）、同一 `capacity` 和同一 `state_path` 重新构造查询，
   即可恢复未输出窗口、当前水位与去重信息，继续 `push` / `drain`；
   已成功 `drain` 返回的窗口不会在重启后重复返回。
+- 旧版仅 SUM 的状态文件（windows 条目 3 元素、sessions 条目 4 元素）仍可恢复：
+  COUNT 视为 1，MIN/MAX 取该窗口唯一可用值，之后继续共同维护四类聚合；
+  列集合不匹配的状态（如四聚合查询读取仅 SUM 状态，或反之）抛
+  `StateStorageError`。
 - 持久模式下每条记录必须带非空字符串 `record_id`，缺失或类型不符抛出
   `InvalidRecordError`。同一查询状态内已处理（`included` 或 `late`）的
   `record_id` 再次出现时，无论事件时间、容量或水位如何都返回 `"duplicate"`，
@@ -124,7 +136,8 @@ GROUP BY user_id, SESSION(event_time, INTERVAL 30 SECOND)
 
 ### 异常
 
-- `QuerySyntaxError`：SQL 出现限定字段之外的字段、不支持的表达式，
+- `QuerySyntaxError`：SQL 出现限定字段之外的字段、不支持的表达式或未知聚合，
+  聚合作用于 `amount` 之外的字段，缺少 `user_id`，窗口非法或窗口混用，
   或窗口间隔不是正的秒数。
 - `QueryConfigurationError`：`capacity` 不是大于零的整数或 `None`。
 - `InvalidRecordError`：记录缺少字段、类型不符或时间无法解析
