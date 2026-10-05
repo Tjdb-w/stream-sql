@@ -1,4 +1,4 @@
-"""流式 SQL 计算引擎：事件时间翻滚/滑动窗口聚合（乱序水位推进、有界背压、Exactly-once 状态）。
+"""流式 SQL 计算引擎：事件时间翻滚/滑动/会话窗口聚合（乱序水位推进、有界背压、Exactly-once 状态）。
 
 公开入口：
     compile_query(sql, capacity=None, state_path=None) -> StreamQuery
@@ -125,7 +125,9 @@ _TOKEN_RE = re.compile(
 _KEYWORDS = frozenset({
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "AS",
     "AND", "OR", "NOT", "TUMBLE", "TUMBLE_START", "TUMBLE_END",
-    "HOP", "HOP_START", "HOP_END", "SUM",
+    "HOP", "HOP_START", "HOP_END",
+    "SESSION", "SESSION_START", "SESSION_END",
+    "SUM",
     "INTERVAL", "SECOND", "ORDERS",
 })
 
@@ -161,10 +163,13 @@ def _tokenize(sql):
 #                | TUMBLE_END   '(' event_time ',' interval ')'
 #                | HOP_START '(' event_time ',' interval ',' interval ')'
 #                | HOP_END   '(' event_time ',' interval ',' interval ')'
+#                | SESSION_START '(' event_time ',' interval ')'
+#                | SESSION_END   '(' event_time ',' interval ')'
 #                | SUM '(' amount ')' ) [ [AS] alias ]
 # group_list  := user_id ',' window_fn （两项顺序可互换）
 # window_fn   := TUMBLE '(' event_time ',' interval ')'
 #              | HOP '(' event_time ',' interval ',' interval ')'
+#              | SESSION '(' event_time ',' interval ')'
 # interval    := INTERVAL ( number | 'number' ) SECOND
 # ---------------------------------------------------------------------------
 
@@ -231,6 +236,10 @@ class _Parser:
                     window_kind != "hop" or item[2] != (size_ms, slide_ms)):
                 raise QuerySyntaxError(
                     "%s parameters must match the HOP window parameters" % item[1].upper())
+            if item[0] == "session_bound" and (
+                    window_kind != "session" or item[2] != slide_ms):
+                raise QuerySyntaxError(
+                    "%s interval must match the SESSION gap interval" % item[1].upper())
 
         seen_names = set()
         columns = []
@@ -282,6 +291,14 @@ class _Parser:
             _validate_hop_params(size_ms, slide_ms)
             col_kind = "window_start" if upper == "HOP_START" else "window_end"
             item = ("hop_bound", col_kind, (size_ms, slide_ms))
+        elif upper in ("SESSION_START", "SESSION_END"):
+            self._expect_punct("(")
+            self._expect_field("event_time")
+            self._expect_punct(",")
+            gap_ms = self._parse_interval()
+            self._expect_punct(")")
+            col_kind = "session_start" if upper == "SESSION_START" else "session_end"
+            item = ("session_bound", col_kind, gap_ms)
         else:
             raise QuerySyntaxError("unsupported select expression: %r" % text)
 
@@ -329,7 +346,7 @@ class _Parser:
                 if saw_user_id:
                     raise QuerySyntaxError("duplicate GROUP BY user_id")
                 saw_user_id = True
-            elif upper in ("TUMBLE", "HOP"):
+            elif upper in ("TUMBLE", "HOP", "SESSION"):
                 if window is not None:
                     raise QuerySyntaxError("duplicate window function in GROUP BY")
                 self._expect_punct("(")
@@ -339,12 +356,15 @@ class _Parser:
                 if upper == "TUMBLE":
                     self._expect_punct(")")
                     window = ("tumble", size_ms, size_ms)
-                else:
+                elif upper == "HOP":
                     self._expect_punct(",")
                     slide_ms = self._parse_interval()
                     self._expect_punct(")")
                     _validate_hop_params(size_ms, slide_ms)
                     window = ("hop", size_ms, slide_ms)
+                else:
+                    self._expect_punct(")")
+                    window = ("session", None, size_ms)
             else:
                 raise QuerySyntaxError("unsupported GROUP BY expression: %r" % text)
             if self._peek() == ("punct", ","):
@@ -355,8 +375,9 @@ class _Parser:
             raise QuerySyntaxError("GROUP BY must include user_id")
         if window is None:
             raise QuerySyntaxError(
-                "GROUP BY must include TUMBLE(event_time, INTERVAL n SECOND) or "
-                "HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND)")
+                "GROUP BY must include TUMBLE(event_time, INTERVAL n SECOND), "
+                "HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND) or "
+                "SESSION(event_time, INTERVAL n SECOND)")
         return window
 
 
@@ -407,9 +428,13 @@ class StreamQuery:
     def __init__(self, columns, window, capacity=None, state_path=None):
         self._columns = tuple(columns)  # ((kind, output_name), ...)
         self._window_kind, self._size_ms, self._slide_ms = window
+        # SESSION 窗口没有固定大小；其间隔（gap）复用 _slide_ms 字段。
+        self._gap_ms = self._slide_ms if self._window_kind == "session" else None
         self._capacity = capacity  # None 表示无界
         self._watermark_ms = None
-        self._state = {}  # (window_start_ms, user_id) -> sum(amount)
+        self._state = {}  # TUMBLE/HOP：(window_start_ms, user_id) -> sum(amount)
+        # SESSION：user_id -> [[start_ms, end_ms, total], ...]
+        self._sessions = {}
         self._state_path = state_path  # None 表示纯内存模式
         self._seen_ids = set() if state_path is not None else None
 
@@ -419,13 +444,18 @@ class StreamQuery:
 
     @property
     def window_ms(self):
-        """窗口大小（UTC 毫秒）。"""
+        """窗口大小（UTC 毫秒）；SESSION 窗口无固定大小，返回 None。"""
         return self._size_ms
 
     @property
     def slide_ms(self):
-        """滑动步长（UTC 毫秒）；TUMBLE 窗口等于窗口大小。"""
-        return self._slide_ms
+        """滑动步长（UTC 毫秒）；TUMBLE 窗口等于窗口大小；SESSION 为 None。"""
+        return None if self._window_kind == "session" else self._slide_ms
+
+    @property
+    def gap_ms(self):
+        """SESSION 窗口的会话间隔 gap（UTC 毫秒）；其他窗口为 None。"""
+        return self._gap_ms
 
     @property
     def capacity(self):
@@ -440,10 +470,11 @@ class StreamQuery:
     def push(self, record):
         """摄入一条记录，返回 "included"、"late" 或 "backpressured"。
 
-        记录落入所有覆盖其事件时间的窗口（HOP 下可能有多个），分别累加
-        到各 (window_start, user_id) 聚合键。迟到记录不改变聚合状态；
-        因容量已满被背压拒绝的记录同样不改变聚合状态、不产生结果，
-        也不影响水位。
+        TUMBLE/HOP 下记录落入所有覆盖其事件时间的窗口（HOP 下可能有多个），
+        分别累加到各 (window_start, user_id) 聚合键；SESSION 下记录只在其
+        所属 user_id 的会话中累加一次 amount，并可能把两侧已有会话连接合并。
+        迟到记录不改变聚合状态；因容量已满被背压拒绝的记录同样不改变
+        聚合状态、不产生结果，也不影响水位。
 
         持久模式（构造时给定 state_path）下每条记录还须带非空字符串
         record_id；已处理过的 record_id 再次出现时返回 "duplicate"，
@@ -478,6 +509,8 @@ class StreamQuery:
                     self._seen_ids.discard(record_id)
                     raise
             return "late"
+        if self._window_kind == "session":
+            return self._push_session(user_id, event_ms, amount, persistent, record_id)
         keys = [(start, user_id) for start in self._window_starts(event_ms)]
         created = [key for key in keys if key not in self._state]
         # 全部新聚合键都能被容量容纳才接收；任一超容量即整体背压，
@@ -500,6 +533,67 @@ class StreamQuery:
                         del self._state[key]
                     else:
                         self._state[key] -= amount
+                raise
+        return "included"
+
+    # ------------------------------------------------------------------
+    # SESSION 会话窗口
+    #
+    # 每个 user_id 维护若干互不重叠、按 start 排序的会话 [start, end]，
+    # end 已含 gap（end = 最大事件时间 + gap）。相邻事件时间差不超过 gap
+    # 即属于同一会话；新记录可同时连接其左右两侧会话（三者合并），
+    # amount 在合并过程中只累加一次。
+    # ------------------------------------------------------------------
+
+    def _session_count(self):
+        return sum(len(sessions) for sessions in self._sessions.values())
+
+    def _push_session(self, user_id, event_ms, amount, persistent, record_id):
+        gap = self._gap_ms
+        sessions = self._sessions.setdefault(user_id, [])
+        # 可连接的会话满足 start - gap <= event_ms <= end：
+        # 左侧会话的最近事件（end - gap）距记录不超过 gap（event_ms <= end），
+        # 右侧会话首事件距记录不超过 gap（start <= event_ms + gap）。
+        # 会话间最近事件差大于 gap，故一条记录至多同时连接左右两个会话。
+        lo = 0
+        while lo < len(sessions) and sessions[lo][1] < event_ms:
+            lo += 1
+        hi = lo
+        while hi < len(sessions) and sessions[hi][0] <= event_ms + gap:
+            hi += 1
+        touched = sessions[lo:hi]
+        created = 0
+        new_start = event_ms
+        new_end = event_ms + gap
+        new_total = amount
+        if touched:
+            new_start = min(new_start, touched[0][0])
+            new_end = max(new_end, touched[-1][1])
+            for sess in touched:
+                new_total += sess[2]
+        else:
+            created = 1
+        # 合并只会减少会话数；仅新建会话时才可能超出容量。
+        if self._capacity is not None and self._session_count() + created > self._capacity:
+            if not sessions:
+                del self._sessions[user_id]
+            return "backpressured"
+        if touched:
+            sessions[lo:hi] = [[new_start, new_end, new_total]]
+        else:
+            sessions.insert(lo, [new_start, new_end, new_total])
+        if persistent:
+            self._seen_ids.add(record_id)
+            try:
+                self._commit()
+            except StateStorageError:
+                self._seen_ids.discard(record_id)
+                if touched:
+                    sessions[lo:lo + 1] = touched
+                else:
+                    sessions.pop(lo)
+                    if not sessions:
+                        del self._sessions[user_id]
                 raise
         return "included"
 
@@ -531,9 +625,16 @@ class StreamQuery:
             self._watermark_ms = ms
 
     def drain(self):
-        """返回所有已确定（窗口结束时刻不超过当前水位）的结果，并从状态中移除。"""
+        """返回所有已确定的结果，并从状态中移除。
+
+        TUMBLE/HOP 在水位达到窗口结束时刻（watermark >= window_end）时确定；
+        SESSION 在水位严格大于会话结束时刻（watermark > session_end）时确定。
+        结果按起始时刻、结束时刻、user_id 排序；每行只含查询声明的列。
+        """
         if self._watermark_ms is None:
             return []
+        if self._window_kind == "session":
+            return self._drain_sessions()
         ready = [
             (window_start, user_id)
             for (window_start, user_id) in self._state
@@ -556,6 +657,35 @@ class StreamQuery:
                 raise
         return rows
 
+    def _drain_sessions(self):
+        watermark = self._watermark_ms
+        ready = []  # (start, end, user_id, total)
+        for user_id, sessions in self._sessions.items():
+            for sess in sessions:
+                if sess[1] < watermark:
+                    ready.append((sess[0], sess[1], user_id, sess[2]))
+        ready.sort(key=lambda item: (
+            item[0], item[1], _user_id_sort_key(item[2])))
+        if not ready:
+            return []
+        rows = []
+        for start, end, user_id, total in ready:
+            sessions = self._sessions[user_id]
+            sessions.remove([start, end, total])
+            if not sessions:
+                del self._sessions[user_id]
+            rows.append(self._build_session_row(start, end, user_id, total))
+        if self._state_path is not None:
+            try:
+                self._commit()
+            except StateStorageError:
+                for start, end, uid, total in ready:
+                    self._sessions.setdefault(uid, []).append(
+                        [start, end, total])
+                    self._sessions[uid].sort(key=lambda sess: sess[0])
+                raise
+        return rows
+
     def _build_row(self, window_start, user_id, total):
         row = {}
         for kind, name in self._columns:
@@ -569,6 +699,19 @@ class StreamQuery:
                 row[name] = total
         return row
 
+    def _build_session_row(self, start_ms, end_ms, user_id, total):
+        row = {}
+        for kind, name in self._columns:
+            if kind == "user_id":
+                row[name] = user_id
+            elif kind == "session_start":
+                row[name] = _format_iso8601(start_ms)
+            elif kind == "session_end":
+                row[name] = _format_iso8601(end_ms)
+            else:  # sum_amount
+                row[name] = total
+        return row
+
     # ------------------------------------------------------------------
     # Exactly-once 状态持久化（仅 state_path 模式下使用）
     # ------------------------------------------------------------------
@@ -577,8 +720,8 @@ class StreamQuery:
         """查询指纹：同一 SQL 语义与 capacity 得到同一指纹。
 
         TUMBLE 沿用既有的 window_ms 形式，保证既有 TUMBLE 状态文件仍可
-        恢复；HOP 以独立的 hop 描述记录 size 与 slide，从而与 TUMBLE
-        以及不同参数的 HOP 相互区分。
+        恢复；HOP 以独立的 hop 描述记录 size 与 slide，SESSION 以独立的
+        session 描述记录 gap，从而使三类窗口以及不同参数相互区分。
         """
         fingerprint = {
             "columns": [[kind, name] for kind, name in self._columns],
@@ -586,10 +729,14 @@ class StreamQuery:
         }
         if self._window_kind == "tumble":
             fingerprint["window_ms"] = self._size_ms
-        else:
+        elif self._window_kind == "hop":
             fingerprint["hop"] = {
                 "size_ms": self._size_ms,
                 "slide_ms": self._slide_ms,
+            }
+        else:
+            fingerprint["session"] = {
+                "gap_ms": self._gap_ms,
             }
         return fingerprint
 
@@ -598,15 +745,24 @@ class StreamQuery:
             "version": _STATE_VERSION,
             "fingerprint": self._fingerprint(),
             "watermark_ms": self._watermark_ms,
-            "windows": [
+            "seen_ids": sorted(self._seen_ids),
+        }
+        if self._window_kind == "session":
+            doc["sessions"] = [
+                [user_id, sess[0], sess[1], sess[2]]
+                for user_id, sessions in sorted(
+                    self._sessions.items(),
+                    key=lambda item: _user_id_sort_key(item[0]))
+                for sess in sessions
+            ]
+        else:
+            doc["windows"] = [
                 [window_start, user_id, total]
                 for (window_start, user_id), total in sorted(
                     self._state.items(),
                     key=lambda item: (item[0][0], _user_id_sort_key(item[0][1])),
                 )
-            ],
-            "seen_ids": sorted(self._seen_ids),
-        }
+            ]
         return json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")
 
     def _commit(self):
@@ -648,7 +804,7 @@ class StreamQuery:
             raise StateStorageError("state file %r is corrupted" % path) from exc
         if not isinstance(doc, dict):
             raise StateStorageError("state file %r is corrupted" % path)
-        for key in ("version", "fingerprint", "watermark_ms", "windows", "seen_ids"):
+        for key in ("version", "fingerprint", "watermark_ms", "seen_ids"):
             if key not in doc:
                 raise StateStorageError(
                     "state file %r is corrupted: missing %r" % (path, key))
@@ -662,7 +818,23 @@ class StreamQuery:
         if watermark is not None and (
                 isinstance(watermark, bool) or not isinstance(watermark, int)):
             raise StateStorageError("state file %r is corrupted: bad watermark" % path)
-        windows = doc["windows"]
+        seen_ids = doc["seen_ids"]
+        if not isinstance(seen_ids, list):
+            raise StateStorageError("state file %r is corrupted: bad seen_ids" % path)
+        seen = set()
+        for record_id in seen_ids:
+            if not isinstance(record_id, str) or not record_id:
+                raise StateStorageError("state file %r is corrupted: bad record_id" % path)
+            seen.add(record_id)
+        if self._window_kind == "session":
+            self._load_sessions(doc, path)
+        else:
+            self._load_windows(doc, path)
+        self._watermark_ms = watermark
+        self._seen_ids = seen
+
+    def _load_windows(self, doc, path):
+        windows = doc.get("windows")
         if not isinstance(windows, list):
             raise StateStorageError("state file %r is corrupted: bad windows" % path)
         state = {}
@@ -680,17 +852,36 @@ class StreamQuery:
                 raise StateStorageError(
                     "state file %r is corrupted: duplicate window" % path)
             state[key] = total
-        seen_ids = doc["seen_ids"]
-        if not isinstance(seen_ids, list):
-            raise StateStorageError("state file %r is corrupted: bad seen_ids" % path)
-        seen = set()
-        for record_id in seen_ids:
-            if not isinstance(record_id, str) or not record_id:
-                raise StateStorageError("state file %r is corrupted: bad record_id" % path)
-            seen.add(record_id)
-        self._watermark_ms = watermark
         self._state = state
-        self._seen_ids = seen
+        self._sessions = {}
+
+    def _load_sessions(self, doc, path):
+        entries = doc.get("sessions")
+        if not isinstance(entries, list):
+            raise StateStorageError("state file %r is corrupted: bad sessions" % path)
+        sessions_by_user = {}
+        for entry in entries:
+            if not isinstance(entry, list) or len(entry) != 4:
+                raise StateStorageError("state file %r is corrupted: bad session" % path)
+            user_id, start_ms, end_ms, total = entry
+            _validate_state_user_id(user_id, path)
+            for value in (start_ms, end_ms, total):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise StateStorageError(
+                        "state file %r is corrupted: bad session" % path)
+            if end_ms < start_ms:
+                raise StateStorageError(
+                    "state file %r is corrupted: session end before start" % path)
+            sessions = sessions_by_user.setdefault(user_id, [])
+            if sessions and start_ms < sessions[-1][0]:
+                raise StateStorageError(
+                    "state file %r is corrupted: sessions not ordered" % path)
+            if sessions and start_ms <= sessions[-1][1]:
+                raise StateStorageError(
+                    "state file %r is corrupted: overlapping sessions" % path)
+            sessions.append([start_ms, end_ms, total])
+        self._sessions = sessions_by_user
+        self._state = {}
 
 
 def _validate_capacity(capacity):
@@ -727,10 +918,26 @@ def compile_query(sql, capacity=None, state_path=None):
         FROM orders
         GROUP BY user_id, HOP(event_time, INTERVAL n SECOND, INTERVAL m SECOND)
 
+    或会话窗口形态：
+
+        SELECT user_id,
+               [SESSION_START(event_time, INTERVAL n SECOND) [AS alias],]
+               [SESSION_END(event_time, INTERVAL n SECOND) [AS alias],]
+               [SUM(amount) [AS alias]]
+        FROM orders
+        GROUP BY user_id, SESSION(event_time, INTERVAL n SECOND)
+
     HOP 的 size（n）与 slide（m）均为正整数秒且 slide 不大于 size；
     一条记录落入所有起点为 slide 整数倍、且覆盖其事件时间的窗口，
-    分别累加到各 (window_start, user_id) 聚合键。TUMBLE 与 HOP 不可
-    混用，HOP_START/HOP_END 的参数必须与 GROUP BY 的 HOP 一致。
+    分别累加到各 (window_start, user_id) 聚合键。
+
+    SESSION 的 gap（n）为正整数秒；每个 user_id 内相邻事件时间差不超过
+    gap 的记录归入同一会话，记录可连接其两侧会话，amount 只累加一次。
+    session_start 为会话内最小事件时间，session_end 为最大事件时间加 gap，
+    不做 epoch 对齐；水位严格大于 session_end 后会话才确定。
+
+    TUMBLE、HOP、SESSION 不可混用，边界函数的参数必须与 GROUP BY 的窗口
+    函数一致。
 
     capacity 省略或为 None 时查询无界；给定正整数时表示查询可保留的
     最大未输出聚合键数（聚合键由窗口起点与 user_id 确定）。记录的全部
